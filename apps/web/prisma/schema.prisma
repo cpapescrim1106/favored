@@ -1,0 +1,257 @@
+// Favored - Polymarket Scanner + Bulk Trader + Portfolio Manager
+// Database Schema
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================================
+// MARKET DATA
+// ============================================================================
+
+/// Polymarket market data (synced from Gamma API)
+model Market {
+  id        String    @id // Polymarket condition_id
+  slug      String    @unique
+  question  String
+  category  String?
+  endDate   DateTime?
+  active    Boolean   @default(true)
+
+  // Latest snapshot
+  yesPrice    Decimal?  @db.Decimal(10, 6)
+  noPrice     Decimal?  @db.Decimal(10, 6)
+  spread      Decimal?  @db.Decimal(10, 6)
+  liquidity   Decimal?  @db.Decimal(18, 2)
+  volume24h   Decimal?  @db.Decimal(18, 2)
+  lastUpdated DateTime?
+
+  // Relations
+  candidates  Candidate[]
+  basketItems BasketItem[]
+  positions   Position[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([active])
+  @@index([category])
+  @@index([endDate])
+  @@map("markets")
+}
+
+// ============================================================================
+// SCANNING & CANDIDATES
+// ============================================================================
+
+/// Scored trading candidate from a scan
+model Candidate {
+  id       String @id @default(cuid())
+  marketId String
+  market   Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  side        String // "YES" or "NO"
+  impliedProb Decimal @db.Decimal(10, 6)
+  score       Decimal @db.Decimal(10, 4)
+  spreadOk    Boolean
+  liquidityOk Boolean
+
+  scanId    String // Links to scan batch
+  scannedAt DateTime @default(now())
+
+  @@index([scanId])
+  @@index([scannedAt])
+  @@index([score])
+  @@map("candidates")
+}
+
+// ============================================================================
+// BASKET & ORDERS
+// ============================================================================
+
+enum BasketStatus {
+  DRAFT
+  PENDING
+  EXECUTING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+/// Basket of orders to be executed together
+model Basket {
+  id         String       @id @default(cuid())
+  status     BasketStatus @default(DRAFT)
+  totalStake Decimal      @db.Decimal(18, 2)
+  itemCount  Int
+  batchCount Int // Number of order batches (max 15 per batch)
+
+  items BasketItem[]
+
+  createdAt  DateTime  @default(now())
+  executedAt DateTime?
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("baskets")
+}
+
+/// Individual item in a basket
+model BasketItem {
+  id       String @id @default(cuid())
+  basketId String
+  basket   Basket @relation(fields: [basketId], references: [id], onDelete: Cascade)
+  marketId String
+  market   Market @relation(fields: [marketId], references: [id], onDelete: Restrict)
+
+  side          String // "YES" or "NO"
+  stake         Decimal @db.Decimal(18, 2)
+  limitPrice    Decimal @db.Decimal(10, 6)
+  snapshotPrice Decimal @db.Decimal(10, 6) // Price at basket build
+
+  // Execution results
+  orderId    String?
+  fillPrice  Decimal? @db.Decimal(10, 6)
+  fillAmount Decimal? @db.Decimal(18, 2)
+  status     String   @default("pending") // pending, submitted, filled, partial, failed, cancelled
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([basketId])
+  @@index([status])
+  @@map("basket_items")
+}
+
+// ============================================================================
+// POSITIONS & TRADES
+// ============================================================================
+
+enum PositionStatus {
+  OPEN
+  CLOSING
+  CLOSED
+  RESOLVED
+}
+
+/// Open or closed position
+model Position {
+  id       String @id @default(cuid())
+  marketId String
+  market   Market @relation(fields: [marketId], references: [id], onDelete: Restrict)
+
+  side      String  @db.VarChar(3) // "YES" or "NO"
+  size      Decimal @db.Decimal(18, 6) // Token amount
+  avgEntry  Decimal @db.Decimal(10, 6)
+  totalCost Decimal @db.Decimal(18, 2)
+
+  // Current state (updated by reconciliation)
+  markPrice     Decimal? @db.Decimal(10, 6)
+  unrealizedPnl Decimal? @db.Decimal(18, 2)
+
+  // Targets
+  takeProfitPrice Decimal? @db.Decimal(10, 6)
+
+  status   PositionStatus @default(OPEN)
+  openedAt DateTime       @default(now())
+  closedAt DateTime?
+
+  trades Trade[]
+
+  @@unique([marketId, side])
+  @@index([status])
+  @@index([openedAt])
+  @@map("positions")
+}
+
+/// Individual trade (entry or exit)
+model Trade {
+  id         String   @id @default(cuid())
+  positionId String
+  position   Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  type    String // "ENTRY" or "EXIT"
+  side    String // "BUY" or "SELL"
+  price   Decimal @db.Decimal(10, 6)
+  size    Decimal @db.Decimal(18, 6)
+  value   Decimal @db.Decimal(18, 2)
+  orderId String?
+  fee     Decimal? @db.Decimal(18, 6)
+
+  executedAt DateTime @default(now())
+
+  @@index([positionId])
+  @@index([executedAt])
+  @@map("trades")
+}
+
+// ============================================================================
+// LOGGING
+// ============================================================================
+
+/// Audit log entry
+model Log {
+  id       String @id @default(cuid())
+  level    String // "INFO", "WARN", "ERROR"
+  category String // "SCAN", "BASKET", "ORDER", "RECONCILE", "EXIT", "SYSTEM"
+  message  String
+  metadata Json? // Additional context (redacted of sensitive data)
+
+  createdAt DateTime @default(now())
+
+  @@index([category])
+  @@index([level])
+  @@index([createdAt])
+  @@map("logs")
+}
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+/// Singleton configuration
+model Config {
+  id String @id @default("singleton")
+
+  // Probability band
+  minProb Decimal @default(0.65) @db.Decimal(5, 4)
+  maxProb Decimal @default(0.90) @db.Decimal(5, 4)
+
+  // Spread/liquidity gates
+  maxSpread    Decimal @default(0.03) @db.Decimal(5, 4) // 3%
+  minLiquidity Decimal @default(5000) @db.Decimal(18, 2)
+
+  // Sizing
+  defaultStake      Decimal @default(50) @db.Decimal(18, 2)
+  maxStakePerMarket Decimal @default(200) @db.Decimal(18, 2)
+
+  // Exposure caps
+  maxExposurePerMarket   Decimal @default(500) @db.Decimal(18, 2)
+  maxExposurePerCategory Decimal @default(2000) @db.Decimal(18, 2)
+  maxOpenPositions       Int     @default(50)
+  maxTotalExposure       Decimal @default(10000) @db.Decimal(18, 2)
+
+  // Take profit
+  takeProfitThreshold Decimal @default(0.95) @db.Decimal(5, 4)
+
+  // Slippage guard
+  maxSlippage Decimal @default(0.02) @db.Decimal(5, 4) // 2%
+
+  // Kill switch
+  killSwitchActive Boolean @default(false)
+
+  // Scan settings
+  scanInterval Int @default(10) // minutes
+
+  // Exclusions (categories to skip, e.g., ["crypto"])
+  excludedCategories String[] @default([])
+
+  updatedAt DateTime @updatedAt
+
+  @@map("config")
+}

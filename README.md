@@ -1,164 +1,54 @@
-# Next.js 15 Full-Stack Template
+# Favored
 
-// TODO: Add a branch with cleaned project to be used at a good start
+Polymarket Scanner + Bulk Trader + Portfolio Manager.
 
-A modern, Docker-ready full-stack template built with Next.js 15, Prisma ORM, and shadcn/ui components. This template provides a robust starting point for building scalable web applications with a clean architecture and developer-friendly setup.
-
-This stack is on the latest trendy tools, is fast to create a simple website, but be cautious if you want to use it for a long/big project, maybe turn you to a better time proved solution.
+A private single-user application for discovering high-probability Polymarket opportunities, building bulk order baskets, and managing positions.
 
 ## Features
 
-- 🚀 **Next.js 15** with App Router
-- ⚛️ **React 19** with server actions
-- 🛢️ **Prisma ORM 7** with PostgreSQL
-- 🎨 **shadcn/ui** components
-- 🔐 **NextAuth** for authentication (with simple role enum access control)
-- 🎯 **TypeScript** for type safety
-- 🐳 **Docker** configuration for development
-- 🔧 **Development Tools**:
-  - Prisma Studio for database management
-  - Adminer to view prisma modifications
+- **Market Scanning**: Automated discovery of markets with 65-90% implied probability
+- **Scoring Algorithm**: 4-component scoring (probability, spread, liquidity, time-to-resolution)
+- **Basket Building**: Group orders with category exposure limits and slippage guards
+- **Portfolio Tracking**: Real-time position monitoring with P&L calculation
+- **Risk Controls**: Kill switch, exposure caps, and slippage guards
+- **Audit Logging**: Full trail of scans, orders, and system events
 
-## Prerequisites
+## Architecture
 
-- Docker and Docker Compose
-
-## Getting Started
-
-### 1. Clone and Setup
-
-```bash
-# Clone the repository
-git clone [repository-url]
-cd [project-name]
-
-# Copy environment file
-cp .env.dist .env
-
-# Install dependencies
-npm install
-
-# Generate Prisma Client (outputs to src/generated/prisma)
-npm run prisma:generate
+```
+favored/
+├── apps/
+│   ├── web/          # Next.js 15 dashboard
+│   └── worker/       # Background job service
+├── packages/
+│   └── shared/       # Polymarket clients, scoring, risk controls
+└── prisma/           # Database schema
 ```
 
-### 2. Configure Environment
+## Quick Start
 
-Update [`.env`](.env) file with your variables, database credentials, and ports.
+1. Copy environment file:
+   ```bash
+   cp .env.example .env
+   ```
 
-### 3. Launch with Docker
+2. Start services:
+   ```bash
+   docker-compose up -d
+   ```
 
-```bash
-# Build and start all services
-docker-compose up -d --build
-```
+3. Open http://localhost:3000
 
-The application will be available at:
-- Next.js App: `http://localhost:3000`
-- Prisma Studio: `http://localhost:5555`
-- Adminer: `http://localhost:8080`
+## MVP Progression
 
-> You can change the ports in the `.env` file.
+- **MVP0 (Shadow Mode)**: Market scanning, scoring, shadow trading (no real orders)
+- **MVP1 (Assisted)**: Real order placement with manual approval
+- **MVP2 (Automation)**: Automated basket building and exit logic
 
-### 4. Seed the Database
+## Tech Stack
 
-```bash
-npm run docker:prisma:db:seed
-```
-> or in local development
-> ```bash
-> npm run prisma:db:seed
-> ```
-
-## Database Management
-
-### During development, apply schema without migration
-
-When you modify the Prisma schema and want to test changes without creating a migration:
-
-1. Push schema changes directly to the database:
-```bash
-npm run docker:prisma:db:push
-```
-
-2. The command will:
-   - Push the schema changes to the database
-   - Regenerate Prisma Client
-
-### Seeding the Database
-
-To populate your database with initial data:
-
-```bash
-# For Docker environment (recommended)
-npm run docker:prisma:db:seed
-
-# For local development
-npm run prisma:db:seed
-```
-
-The command will execute the seed script defined in `prisma/seed.ts` to create initial data in your database.
-
-### Before commit, apply schema changes
-When you modify the Prisma schema [`prisma/schema/schema.prisma`](prisma/schema/schema.prisma), you need to:
-
-1. Generate a new migration:
-```bash
-npm run docker:prisma:migrate:dev
-```
-
-2. The command will:
-   - Create a new migration file
-   - Apply the migration to your database
-
-3. **Important**: In Prisma 7, you must now run the seed command explicitly after migrations:
-```bash
-npm run docker:prisma:db:seed
-```
-
-## Development Workflow
-
-### Docker Development (Recommended)
-```bash
-# Start all services
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop all services
-docker-compose down
-```
-
-#### Installing New Dependencies
-
-When adding new npm packages to the project:
-
-1. Install the package locally first:
-```bash
-npm install package-name
-```
-
-2. Rebuild the Docker container to include the new dependency:
-```bash
-docker-compose up -d --build
-```
-
-> Note: The rebuild is necessary because dependencies are installed inside the Docker container during the build process.
-
-### Local Development
-```bash
-# Install dependencies
-npm install
-
-# Start development server
-npm run dev
-```
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+- Next.js 15 + React 19 + TypeScript
+- Prisma + PostgreSQL
+- shadcn/ui components
+- Turborepo monorepo
+- Docker + Coolify deployment

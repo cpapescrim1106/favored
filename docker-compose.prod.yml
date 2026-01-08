@@ -1,0 +1,52 @@
+# Favored - Production Docker Compose
+# For deployment via Coolify or similar
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      POLYMARKET_API_KEY: ${POLYMARKET_API_KEY}
+      POLYMARKET_API_SECRET: ${POLYMARKET_API_SECRET}
+      POLYMARKET_PASSPHRASE: ${POLYMARKET_PASSPHRASE}
+      WALLET_PRIVATE_KEY: ${WALLET_PRIVATE_KEY}
+      NODE_ENV: production
+      SCAN_INTERVAL: "*/10 * * * *"
+
+volumes:
+  postgres_data:

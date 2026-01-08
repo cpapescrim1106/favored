@@ -1,2 +1,0 @@
-export const EXCERPT_MAX_LENGTH = 255;
-export const EXCERPT_RECOMMENDED_LENGTH = 80;

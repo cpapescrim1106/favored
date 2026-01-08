@@ -1,0 +1,33 @@
+# Favored Worker - Development Dockerfile
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies for Prisma
+RUN apk add --no-cache openssl
+
+# Copy package files
+COPY package.json turbo.json ./
+COPY apps/worker/package.json apps/worker/
+COPY apps/web/package.json apps/web/
+COPY packages/shared/package.json packages/shared/
+
+# Install dependencies
+RUN npm install
+
+# Copy source code
+COPY apps/worker apps/worker
+COPY apps/web/prisma apps/web/prisma
+COPY apps/web/prisma.config.ts apps/web/prisma.config.ts
+COPY packages/shared packages/shared
+
+# Create output directory for Prisma client generation
+RUN mkdir -p apps/web/src/generated
+
+# Generate Prisma client (uses web's schema)
+RUN npm run db:generate --workspace=@favored/web
+
+# Build shared package
+RUN npm run build --workspace=@favored/shared
+
+CMD ["npm", "run", "dev", "--workspace=@favored/worker"]

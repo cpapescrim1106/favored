@@ -1,0 +1,9 @@
+# Caddy reverse proxy for HTTPS with Tailscale certs
+{
+	auto_https off
+}
+
+:3443 {
+	tls /certs/maximus.taila6f62d.ts.net.crt /certs/maximus.taila6f62d.ts.net.key
+	reverse_proxy web:3000
+}
