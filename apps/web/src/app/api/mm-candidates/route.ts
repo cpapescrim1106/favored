@@ -2,6 +2,8 @@ import { prisma } from "@/lib/db";
 import { NextRequest, NextResponse } from "next/server";
 import {
   getOrderbook,
+  getMidpointPrice,
+  getSpread,
   screenMarketForMM,
   DEFAULT_MM_SCREENING_PARAMS,
   type MMScreeningParams,
@@ -36,13 +38,22 @@ export async function GET(request: NextRequest) {
     }
 
     // Fetch active markets from DB
-    // Pre-filter: must have decent volume and not already have a market maker
+    // Pre-filter: must have decent volume, valid price range, clobTokenIds, and no market maker
     const markets = await prisma.market.findMany({
       where: {
         active: true,
         marketMaker: null, // Not already being made
         volume24h: {
           gte: params.minVolume24h * 0.5, // Looser filter, let scoring handle it
+        },
+        // Exclude extreme probabilities (below excludeMidLt or above excludeMidGt)
+        yesPrice: {
+          gte: params.excludeMidLt,
+          lte: params.excludeMidGt,
+        },
+        // Must have clobTokenIds for orderbook access
+        clobTokenIds: {
+          isEmpty: false,
         },
         // Must have end date in the future
         OR: [
@@ -51,7 +62,7 @@ export async function GET(request: NextRequest) {
         ],
       },
       orderBy: { volume24h: "desc" },
-      take: limit * 2, // Fetch extra since some will be filtered
+      take: limit * 3, // Fetch extra since some will be filtered
     });
 
     console.log(`[MM Candidates] Screening ${markets.length} markets...`);
@@ -61,10 +72,21 @@ export async function GET(request: NextRequest) {
     // Screen each market
     for (const market of markets) {
       try {
-        // Fetch orderbook from CLOB
-        const book = await getOrderbook(market.id);
+        // Get YES token ID from clobTokenIds (first element is YES)
+        const yesTokenId = market.clobTokenIds?.[0];
+        if (!yesTokenId) {
+          console.log(`[MM Candidates] Skipping ${market.slug} - no clobTokenIds`);
+          continue;
+        }
 
-        // Screen the market
+        // Fetch orderbook, midpoint, and spread from CLOB in parallel
+        const [book, midpoint, spread] = await Promise.all([
+          getOrderbook(yesTokenId),
+          getMidpointPrice(yesTokenId),
+          getSpread(yesTokenId),
+        ]);
+
+        // Screen the market with CLOB pricing (more accurate than raw book)
         const result = screenMarketForMM(
           {
             id: market.id,
@@ -76,7 +98,8 @@ export async function GET(request: NextRequest) {
             volume24h: market.volume24h ? Number(market.volume24h) : 0,
           },
           book,
-          params
+          params,
+          { midpoint, spread }
         );
 
         // Filter based on eligibility and score

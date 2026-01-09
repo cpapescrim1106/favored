@@ -7,6 +7,11 @@
  * - Price zone (avoid extremes)
  * - Volume/activity
  * - Resolution clarity
+ *
+ * NOTE: Polymarket's CLOB orderbook shows limit orders only. The actual
+ * midpoint and spread are calculated differently by their system (likely
+ * volume-weighted or based on recent trades). We use the /midpoint and
+ * /spread endpoints to get accurate pricing instead of raw book calculation.
  */
 
 // ============================================================================
@@ -21,6 +26,12 @@ export interface OrderBookLevel {
 export interface OrderBook {
   bids: OrderBookLevel[];
   asks: OrderBookLevel[];
+}
+
+// CLOB pricing data from dedicated endpoints (more accurate than raw book)
+export interface CLOBPricing {
+  midpoint: number | null;  // From /midpoint endpoint
+  spread: number | null;    // From /spread endpoint (in decimal, e.g., 0.01)
 }
 
 export interface MMScreeningParams {
@@ -87,19 +98,19 @@ export interface MMScreeningResult {
 export const MM_TICK_SIZE = 0.01;
 
 export const DEFAULT_MM_SCREENING_PARAMS: MMScreeningParams = {
-  minTimeToEndHours: 48,
-  preferredTimeToEndMinDays: 7,
-  preferredTimeToEndMaxDays: 90,
-  maxSpreadTicks: 2,
-  minTopDepthNotional: 300,
-  minDepthWithin3cNotional: 2000,
-  minDepthEachSideWithin3c: 800,
-  minBookSlope: 0.15,
-  minVolume24h: 10000,
-  excludeMidLt: 0.10,
-  excludeMidGt: 0.90,
-  preferredMidMin: 0.20,
-  preferredMidMax: 0.80,
+  minTimeToEndHours: 24,
+  preferredTimeToEndMinDays: 3,
+  preferredTimeToEndMaxDays: 120,
+  maxSpreadTicks: 5, // 5 ticks = $0.05 max spread (more realistic for crypto markets)
+  minTopDepthNotional: 100, // $100 at top of book
+  minDepthWithin3cNotional: 500, // $500 within ±3¢
+  minDepthEachSideWithin3c: 100, // $100 each side within ±3¢
+  minBookSlope: 0.05, // More lenient slope requirement
+  minVolume24h: 1000, // Lower volume threshold
+  excludeMidLt: 0.05, // Exclude < 5% implied prob
+  excludeMidGt: 0.95, // Exclude > 95% implied prob
+  preferredMidMin: 0.15, // Preferred 15-85%
+  preferredMidMax: 0.85,
 };
 
 // Keywords that indicate ambiguous resolution
@@ -368,18 +379,43 @@ export interface MarketData {
 
 /**
  * Screen a market for MM viability
+ *
+ * @param market - Market data from database
+ * @param book - Order book data (used for depth analysis)
+ * @param params - Screening parameters
+ * @param clobPricing - Optional pricing from CLOB /midpoint and /spread endpoints
+ *                      If provided, these are used instead of calculating from book
  */
 export function screenMarketForMM(
   market: MarketData,
   book: OrderBook,
-  params: MMScreeningParams = DEFAULT_MM_SCREENING_PARAMS
+  params: MMScreeningParams = DEFAULT_MM_SCREENING_PARAMS,
+  clobPricing?: CLOBPricing
 ): MMScreeningResult {
   const flags: string[] = [];
   const disqualifyReasons: string[] = [];
 
   // Calculate basic metrics
-  const midPrice = calculateMidPriceFromBook(book);
-  const spreadTicks = calculateSpreadTicks(book);
+  // Prefer CLOB pricing endpoints (more accurate) over raw book calculation
+  let midPrice: number | null;
+  let spreadTicks: number | null;
+
+  if (clobPricing?.midpoint !== null && clobPricing?.midpoint !== undefined) {
+    // Use CLOB /midpoint endpoint (more accurate)
+    midPrice = clobPricing.midpoint;
+  } else {
+    // Fallback to book calculation
+    midPrice = calculateMidPriceFromBook(book);
+  }
+
+  if (clobPricing?.spread !== null && clobPricing?.spread !== undefined) {
+    // Use CLOB /spread endpoint (more accurate)
+    // Convert decimal spread to ticks
+    spreadTicks = Math.round(clobPricing.spread / MM_TICK_SIZE);
+  } else {
+    // Fallback to book calculation
+    spreadTicks = calculateSpreadTicks(book);
+  }
 
   // Handle missing data
   if (midPrice === null || spreadTicks === null) {
