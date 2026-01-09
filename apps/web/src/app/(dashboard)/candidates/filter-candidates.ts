@@ -13,6 +13,7 @@ export interface Candidate {
   scannedAt: string;
   market: {
     slug: string;
+    eventSlug: string | null;
     question: string;
     category: string | null;
     endDate: string | null;

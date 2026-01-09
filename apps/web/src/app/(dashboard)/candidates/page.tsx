@@ -404,7 +404,7 @@ function CandidatesPageContent() {
                   {/* Market */}
                   <TableCell className={cn(col.market.width, col.market.alignCell, CELL_PADDING)}>
                     <a
-                      href={`https://polymarket.com/event/${candidate.market.slug}`}
+                      href={`https://polymarket.com/event/${candidate.market.eventSlug || candidate.market.slug}`}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="hover:underline truncate block font-medium"

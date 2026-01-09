@@ -30,6 +30,7 @@ export async function GET(request: NextRequest) {
         market: {
           select: {
             slug: true,
+            eventSlug: true,
             question: true,
             category: true,
             endDate: true,
@@ -57,6 +58,7 @@ export async function GET(request: NextRequest) {
       scannedAt: c.scannedAt.toISOString(),
       market: {
         slug: c.market.slug,
+        eventSlug: c.market.eventSlug,
         question: c.market.question,
         category: c.market.category,
         endDate: c.market.endDate?.toISOString() || null,

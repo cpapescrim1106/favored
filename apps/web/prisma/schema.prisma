@@ -18,6 +18,7 @@ datasource db {
 model Market {
   id        String    @id // Polymarket condition_id
   slug      String    @unique
+  eventSlug String?   // Parent event slug for Polymarket URL
   question  String
   category  String?
   endDate   DateTime?
@@ -31,10 +32,14 @@ model Market {
   volume24h   Decimal?  @db.Decimal(18, 2)
   lastUpdated DateTime?
 
+  // CLOB token IDs for orderbook access (YES token, NO token)
+  clobTokenIds String[] @default([])
+
   // Relations
   candidates  Candidate[]
   basketItems BasketItem[]
   positions   Position[]
+  marketMaker MarketMaker?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -192,6 +197,118 @@ model Trade {
 }
 
 // ============================================================================
+// MARKET MAKING
+// ============================================================================
+
+/// Market maker configuration and state for a single market
+model MarketMaker {
+  id       String @id @default(cuid())
+  marketId String @unique
+  market   Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  // Status
+  active Boolean @default(true)
+  paused Boolean @default(false)
+
+  // Quote Parameters (in shares, not dollars)
+  targetSpread  Decimal @db.Decimal(5, 4) // e.g., 0.02 = 2%
+  orderSize     Decimal @db.Decimal(18, 6) // Shares per side
+  maxInventory  Decimal @db.Decimal(18, 6) // Max shares exposure per outcome
+  skewFactor    Decimal @db.Decimal(5, 4) // Max price shift at full inventory
+  quotingPolicy String  @default("inside") // "touch", "inside", "back"
+
+  // Dual-outcome inventory (in shares)
+  yesInventory Decimal @default(0) @db.Decimal(18, 6) // YES token position
+  noInventory  Decimal @default(0) @db.Decimal(18, 6) // NO token position
+
+  // PnL tracking
+  realizedPnl     Decimal @default(0) @db.Decimal(18, 6) // Realized profit/loss
+  avgYesCost      Decimal @default(0) @db.Decimal(10, 6) // Avg cost basis for YES
+  avgNoCost       Decimal @default(0) @db.Decimal(10, 6) // Avg cost basis for NO
+
+  // Risk guardrails
+  minTimeToResolution Int      @default(24) // Hours before market end to stop quoting
+  volatilityPauseUntil DateTime? // Pause quoting until this time
+
+  // Timestamps
+  lastQuoteAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // Relations
+  orders       MarketMakerOrder[]
+  fills        MarketMakerFill[]
+  quoteHistory QuoteHistory[]
+
+  @@index([active])
+  @@map("market_makers")
+}
+
+/// Active orders for a market maker (up to 4 per market: YES bid/ask + NO bid/ask)
+model MarketMakerOrder {
+  id            String      @id @default(cuid())
+  marketMakerId String
+  marketMaker   MarketMaker @relation(fields: [marketMakerId], references: [id], onDelete: Cascade)
+
+  outcome String // "YES" or "NO"
+  side    String // "BID" or "ASK"
+  orderId String // CLOB order ID
+  tokenId String // Token ID for this outcome
+  price   Decimal @db.Decimal(10, 6)
+  size    Decimal @db.Decimal(18, 6) // Shares
+
+  placedAt  DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([marketMakerId, outcome, side])
+  @@index([orderId])
+  @@map("market_maker_orders")
+}
+
+/// Fill records for PnL tracking (FIFO/avg-cost)
+model MarketMakerFill {
+  id            String      @id @default(cuid())
+  marketMakerId String
+  marketMaker   MarketMaker @relation(fields: [marketMakerId], references: [id], onDelete: Cascade)
+
+  outcome    String // "YES" or "NO"
+  side       String // "BUY" or "SELL"
+  orderId    String // CLOB order ID that was filled
+  price      Decimal @db.Decimal(10, 6)
+  size       Decimal @db.Decimal(18, 6) // Shares filled
+  value      Decimal @db.Decimal(18, 6) // price * size
+  fee        Decimal @default(0) @db.Decimal(18, 6)
+  realizedPnl Decimal? @db.Decimal(18, 6) // PnL realized from this fill (for sells)
+
+  filledAt DateTime @default(now())
+
+  @@index([marketMakerId])
+  @@index([filledAt])
+  @@map("market_maker_fills")
+}
+
+/// Audit trail of quote updates and state changes
+model QuoteHistory {
+  id            String      @id @default(cuid())
+  marketMakerId String
+  marketMaker   MarketMaker @relation(fields: [marketMakerId], references: [id], onDelete: Cascade)
+
+  action   String // "QUOTE_PLACED", "QUOTE_UPDATED", "QUOTE_CANCELLED", "FILL", "PAUSE", "RESUME", "ERROR"
+  outcome  String? // "YES" or "NO"
+  side     String? // "BID" or "ASK"
+  price    Decimal? @db.Decimal(10, 6)
+  size     Decimal? @db.Decimal(18, 6)
+  orderId  String?
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([marketMakerId])
+  @@index([createdAt])
+  @@map("quote_history")
+}
+
+// ============================================================================
 // LOGGING
 // ============================================================================
 
@@ -251,6 +368,16 @@ model Config {
 
   // Exclusions (categories to skip, e.g., ["crypto"])
   excludedCategories String[] @default([])
+
+  // Market Making defaults (sizes in shares)
+  mmDefaultSpread         Decimal @default(0.02) @db.Decimal(5, 4) // 2%
+  mmDefaultOrderSize      Decimal @default(100) @db.Decimal(18, 6) // Shares per side
+  mmDefaultMaxInventory   Decimal @default(500) @db.Decimal(18, 6) // Max shares per outcome
+  mmDefaultSkewFactor     Decimal @default(0.02) @db.Decimal(5, 4) // Max price shift at full inv
+  mmDefaultQuotingPolicy  String  @default("inside") // "touch", "inside", "back"
+  mmRefreshThreshold      Decimal @default(0.01) @db.Decimal(5, 4) // 1% price move triggers refresh
+  mmMinTimeToResolution   Int     @default(24) // Hours before end to stop quoting
+  mmEnabled               Boolean @default(false) // Global MM kill switch
 
   updatedAt DateTime @updatedAt
 

@@ -115,11 +115,25 @@ export async function runScanJob(): Promise<void> {
         ? Math.max(0, (endDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24))
         : 365; // Default to 1 year if no end date
 
+      // Get event slug for Polymarket URL (prefer seriesSlug for sports events)
+      const eventSlug = event?.seriesSlug || event?.slug || null;
+
+      // Parse CLOB token IDs from Gamma API response
+      let clobTokenIds: string[] = [];
+      if (market.clobTokenIds) {
+        try {
+          clobTokenIds = JSON.parse(market.clobTokenIds);
+        } catch {
+          // Ignore parse errors
+        }
+      }
+
       // Upsert market data
       await prisma.market.upsert({
         where: { id: market.id },
         update: {
           slug: market.slug,
+          eventSlug,
           question: market.question,
           category,
           endDate: endDate,
@@ -129,11 +143,13 @@ export async function runScanJob(): Promise<void> {
           spread: spread,
           liquidity: liquidityValue,
           volume24h: volume24h,
+          clobTokenIds,
           lastUpdated: new Date(),
         },
         create: {
           id: market.id,
           slug: market.slug,
+          eventSlug,
           question: market.question,
           category,
           endDate: endDate,
@@ -143,6 +159,7 @@ export async function runScanJob(): Promise<void> {
           spread: spread,
           liquidity: liquidityValue,
           volume24h: volume24h,
+          clobTokenIds,
           lastUpdated: new Date(),
         },
       });
