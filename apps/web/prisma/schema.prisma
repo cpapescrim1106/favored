@@ -55,7 +55,8 @@ model Candidate {
   marketId String
   market   Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
 
-  side        String // "YES" or "NO"
+  side        String  // "YES" or "NO"
+  outcomeName String? // Display name: "Rams", "Yes", "Trump", etc.
   impliedProb Decimal @db.Decimal(10, 6)
   score       Decimal @db.Decimal(10, 4)
   spreadOk    Boolean

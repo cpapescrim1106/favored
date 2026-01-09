@@ -61,15 +61,23 @@ export async function runScanJob(): Promise<void> {
       const yesIndex = outcomes.findIndex((o) => o === "Yes");
       const noIndex = outcomes.findIndex((o) => o === "No");
 
+      // Track outcome names for display
+      let yesOutcomeName: string;
+      let noOutcomeName: string;
+
       if (yesIndex !== -1 && noIndex !== -1) {
         // Standard Yes/No market
         yesPrice = prices[yesIndex];
         noPrice = prices[noIndex];
+        yesOutcomeName = "Yes";
+        noOutcomeName = "No";
       } else if (outcomes.length === 2) {
         // Team vs team market (e.g., "Maple Leafs" vs "Flyers")
         // Treat first outcome as YES side, second as NO side
         yesPrice = prices[0];
         noPrice = prices[1];
+        yesOutcomeName = outcomes[0];
+        noOutcomeName = outcomes[1];
         isTeamMarket = true;
       } else {
         continue; // Skip multi-outcome markets
@@ -143,6 +151,7 @@ export async function runScanJob(): Promise<void> {
       // Score both YES and NO sides
       for (const side of ["YES", "NO"] as const) {
         const price = side === "YES" ? yesPrice : noPrice;
+        const outcomeName = side === "YES" ? yesOutcomeName : noOutcomeName;
         const impliedProb = price; // Price is the implied probability
 
         const scoringInput: ScoringInput = {
@@ -165,6 +174,7 @@ export async function runScanJob(): Promise<void> {
             data: {
               marketId: market.id,
               side,
+              outcomeName,
               impliedProb,
               score: result.score,
               spreadOk: spread <= Number(config.maxSpread),

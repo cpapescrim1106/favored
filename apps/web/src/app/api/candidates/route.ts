@@ -5,7 +5,7 @@ export async function GET(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams;
     const minScore = Number(searchParams.get("minScore") || 0);
-    const limit = Number(searchParams.get("limit") || 100);
+    const limit = Number(searchParams.get("limit") || 1000);
 
     // Get the most recent scan ID
     const latestScan = await prisma.candidate.findFirst({
@@ -49,6 +49,7 @@ export async function GET(request: NextRequest) {
       id: c.id,
       marketId: c.marketId,
       side: c.side,
+      outcomeName: c.outcomeName || c.side, // Fallback to side for old data
       impliedProb: Number(c.impliedProb),
       score: Number(c.score),
       spreadOk: c.spreadOk,
