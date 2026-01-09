@@ -9,11 +9,34 @@ export interface GammaToken {
   winner?: boolean;
 }
 
+export interface GammaTag {
+  id: number;
+  slug: string | null;
+  label: string | null;
+  isCarousel?: boolean | null;
+  forceShow?: boolean | null;
+  forceHide?: boolean | null;
+  publishedAt?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  requiresTranslation?: boolean | null;
+}
+
+export interface GammaTagRelationship {
+  id: string;
+  tagID: number;
+  relatedTagID: number;
+  rank: number;
+}
+
 export interface GammaMarketEvent {
   id: string;
   title: string;
   slug: string;
   seriesSlug?: string;
+  category?: string;
+  subcategory?: string;
+  tags?: GammaTag[];
 }
 
 export interface GammaMarket {
@@ -34,6 +57,7 @@ export interface GammaMarket {
   conditionId?: string;
   // Events array contains parent event info
   events?: GammaMarketEvent[];
+  tags?: GammaTag[];
   // Legacy field - may not exist in new API
   tokens?: GammaToken[];
 }
@@ -42,7 +66,22 @@ export interface GammaEvent {
   id: string;
   title: string;
   slug: string;
+  seriesSlug?: string;
+  category?: string;
+  subcategory?: string;
+  tags?: GammaTag[];
   markets: GammaMarket[];
+}
+
+export interface GammaSport {
+  id: number;
+  sport: string; // e.g., "nhl", "nfl", "nba"
+  image: string;
+  resolution: string;
+  ordering: string;
+  tags: string; // Comma-separated tag IDs
+  series: string; // Series ID for fetching events
+  createdAt: string;
 }
 
 export interface CLOBOrder {
@@ -64,17 +103,25 @@ export interface CLOBPosition {
   side: "YES" | "NO";
 }
 
+export type OrderType = "GTC" | "GTD" | "FOK" | "FAK";
+
 export interface OrderRequest {
   tokenId: string;
   side: "BUY" | "SELL";
   price: number;
   size: number;
+  orderType?: OrderType;
+  postOnly?: boolean;
+  expiration?: number; // Unix timestamp for GTD orders
 }
 
 export interface OrderResponse {
   success: boolean;
   orderId?: string;
   error?: string;
+  status?: string;
+  takingAmount?: string;
+  makingAmount?: string;
 }
 
 export interface BatchOrderRequest {
