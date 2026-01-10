@@ -86,9 +86,17 @@ export function calculateQuotes(params: QuoteParams): Quote {
     bidPrice = Math.min(bidPrice, bestBid);
     askPrice = Math.max(askPrice, bestAsk);
   } else if (quotingPolicy === "inside" && bestBid !== undefined && bestAsk !== undefined) {
-    // Improve by one tick inside the spread
-    bidPrice = Math.max(bidPrice, bestBid + TICK_SIZE);
-    askPrice = Math.min(askPrice, bestAsk - TICK_SIZE);
+    // Check if spread is wide enough to go inside (need > 1 tick)
+    const currentSpread = bestAsk - bestBid;
+    if (currentSpread > TICK_SIZE) {
+      // Improve by one tick inside the spread
+      bidPrice = Math.max(bidPrice, bestBid + TICK_SIZE);
+      askPrice = Math.min(askPrice, bestAsk - TICK_SIZE);
+    } else {
+      // Spread too tight (1 tick or less), fall back to touch
+      bidPrice = Math.min(bidPrice, bestBid);
+      askPrice = Math.max(askPrice, bestAsk);
+    }
   }
   // "back" policy: use calculated prices as-is (back of the book)
 
