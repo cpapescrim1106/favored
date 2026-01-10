@@ -524,6 +524,42 @@ export async function placeBatchOrders(
 }
 
 /**
+ * Get order details by ID
+ * Returns the order with its current status and fill information
+ */
+export async function getOrder(orderId: string): Promise<{
+  id: string;
+  status: string;
+  size_matched: string;
+  original_size: string;
+  price: string;
+  side: string;
+  outcome: string;
+  asset_id: string;
+} | null> {
+  try {
+    const { client } = await initializeClobClient();
+    const order = await client.getOrder(orderId);
+    if (!order) return null;
+
+    return {
+      id: order.id,
+      status: order.status || "unknown",
+      size_matched: order.size_matched || "0",
+      original_size: order.original_size || "0",
+      price: order.price || "0",
+      side: order.side || "",
+      outcome: order.outcome || "",
+      asset_id: order.asset_id || "",
+    };
+  } catch (error) {
+    // Order not found or error - likely cancelled/expired
+    console.error(`[CLOB] Failed to get order ${orderId}:`, error);
+    return null;
+  }
+}
+
+/**
  * Cancel an order
  */
 export async function cancelOrder(orderId: string): Promise<boolean> {
