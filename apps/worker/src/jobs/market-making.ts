@@ -182,6 +182,18 @@ async function checkAllFills(
     // Fetch all open orders from CLOB
     const openOrders = await fetchActiveOrders();
     const openOrderIds = new Set(openOrders.map((o) => o.id));
+    const trackedOrdersCount = marketMakers.reduce((sum, mm) => {
+      if (!("orders" in mm) || !Array.isArray(mm.orders)) return sum;
+      return sum + mm.orders.length;
+    }, 0);
+
+    // Defensive guard: empty open order list while we have tracked orders
+    if (openOrders.length === 0 && trackedOrdersCount > 0) {
+      console.warn(
+        "[MarketMaking] Open orders returned empty while tracked orders exist; skipping fill reconciliation"
+      );
+      return;
+    }
 
     // Check each market maker's orders
     for (const mm of marketMakers) {
@@ -192,29 +204,17 @@ async function checkAllFills(
         if (openOrderIds.has(order.orderId)) continue;
 
         // Order is not in open orders - check if it was actually filled
-        const orderDetails = await getOrder(order.orderId);
+        const orderResult = await getOrder(order.orderId);
 
-        if (orderDetails) {
-          const sizeMatched = Number(orderDetails.size_matched || 0);
-          const originalSize = Number(orderDetails.original_size || order.size);
+        if (orderResult.status === "error") {
+          console.warn(
+            `[MarketMaking] Failed to fetch order ${order.orderId}: ${orderResult.message}`
+          );
+          continue;
+        }
 
-          if (sizeMatched > 0) {
-            // Order was (at least partially) filled - process the fill
-            console.log(`[MarketMaking] Order ${order.orderId} filled: ${sizeMatched}/${originalSize}`);
-            await processFill(mm, order, result, sizeMatched);
-          } else {
-            // Order was cancelled/expired without any fills - just delete the record
-            console.log(`[MarketMaking] Order ${order.orderId} cancelled/expired (no fills)`);
-            await prisma.marketMakerOrder.delete({ where: { id: order.id } });
-            await logQuoteAction(mm.id, "ORDER_CANCELLED", {
-              outcome: order.outcome,
-              side: order.side,
-              orderId: order.orderId,
-            });
-          }
-        } else {
-          // Can't get order details - could be very old or system error
-          // Delete the stale order record without updating inventory
+        if (orderResult.status === "not_found") {
+          // Likely cancelled/expired or too old - remove stale record
           console.log(`[MarketMaking] Order ${order.orderId} not found - removing stale record`);
           await prisma.marketMakerOrder.delete({ where: { id: order.id } });
           await logQuoteAction(mm.id, "ORDER_STALE", {
@@ -223,7 +223,47 @@ async function checkAllFills(
             orderId: order.orderId,
             error: "Order not found in CLOB API",
           });
+          continue;
         }
+
+        const orderDetails = orderResult.order;
+        const status = orderDetails.status.toUpperCase();
+        const sizeMatched = Number(orderDetails.size_matched || 0);
+        const originalSize = Number(orderDetails.original_size || order.size);
+        const isLive = status === "LIVE" || status === "OPEN";
+        const isTerminal = status === "MATCHED" || status === "CANCELLED" || status === "EXPIRED";
+
+        if (isLive) {
+          console.warn(
+            `[MarketMaking] Order ${order.orderId} reported ${status} but missing from open orders; keeping record`
+          );
+          continue;
+        }
+
+        if (sizeMatched > 0) {
+          // Order was (at least partially) filled - process the fill
+          console.log(`[MarketMaking] Order ${order.orderId} filled: ${sizeMatched}/${originalSize}`);
+          await processFill(mm, order, result, sizeMatched);
+          continue;
+        }
+
+        if (isTerminal) {
+          // Cancelled/expired/fully matched without any fills - delete record
+          console.log(`[MarketMaking] Order ${order.orderId} ${status.toLowerCase()} (no fills)`);
+          await prisma.marketMakerOrder.delete({ where: { id: order.id } });
+          await logQuoteAction(mm.id, "ORDER_CANCELLED", {
+            outcome: order.outcome,
+            side: order.side,
+            orderId: order.orderId,
+            status,
+          });
+          continue;
+        }
+
+        // Unknown status: keep record and retry next cycle
+        console.warn(
+          `[MarketMaking] Order ${order.orderId} returned unknown status ${status}; keeping record`
+        );
       }
     }
   } catch (error) {
@@ -245,7 +285,16 @@ async function processFill(
   const isYes = order.outcome === "YES";
   const price = Number(order.price);
   // Use actual filled size if provided, otherwise fall back to order size
-  const size = filledSize !== undefined ? filledSize : Number(order.size);
+  let size = filledSize !== undefined ? filledSize : Number(order.size);
+  const availableInventory = isYes ? Number(mm.yesInventory) : Number(mm.noInventory);
+
+  if (!isBuy && size > availableInventory) {
+    console.warn(
+      `[MarketMaking] Clamping sell fill size from ${size} to ${availableInventory} for ${order.orderId}`
+    );
+    size = availableInventory;
+  }
+
   const value = price * size;
 
   // Skip if nothing was actually filled
@@ -766,8 +815,43 @@ async function processMarketMaker(
     return;
   }
 
-  // Cancel existing orders
+  // Build map of desired quotes: key = "outcome-side", value = {price, size, tokenId}
+  const desiredQuotes = new Map<string, { price: number; size: number; tokenId: string }>();
+
+  if (yesQuote.bidSize > 0) {
+    desiredQuotes.set("YES-BID", { price: yesQuote.bidPrice, size: yesQuote.bidSize, tokenId: yesTokenId });
+  }
+  if (yesQuote.askSize > 0) {
+    desiredQuotes.set("YES-ASK", { price: yesQuote.askPrice, size: yesQuote.askSize, tokenId: yesTokenId });
+  }
+  if (noQuote.bidSize > 0) {
+    desiredQuotes.set("NO-BID", { price: noQuote.bidPrice, size: noQuote.bidSize, tokenId: noTokenId });
+  }
+  if (noQuote.askSize > 0) {
+    desiredQuotes.set("NO-ASK", { price: noQuote.askPrice, size: noQuote.askSize, tokenId: noTokenId });
+  }
+
+  // Track which desired quotes are already satisfied by existing orders
+  const satisfiedQuotes = new Set<string>();
+  const ordersToCancel: typeof existingOrders = [];
+
+  // Check existing orders against desired quotes
   for (const order of existingOrders) {
+    const key = `${order.outcome}-${order.side}`;
+    const desired = desiredQuotes.get(key);
+
+    if (desired && Math.abs(Number(order.price) - desired.price) < 0.001) {
+      // Order is at the correct price - keep it to maintain queue priority
+      satisfiedQuotes.add(key);
+      console.log(`[MarketMaking] Keeping ${key} order at ${order.price} (queue priority)`);
+    } else {
+      // Price changed or quote no longer needed - cancel it
+      ordersToCancel.push(order);
+    }
+  }
+
+  // Cancel orders that need to be replaced
+  for (const order of ordersToCancel) {
     try {
       await cancelOrder(order.orderId);
       await prisma.marketMakerOrder.delete({ where: { id: order.id } });
@@ -776,14 +860,15 @@ async function processMarketMaker(
         outcome: order.outcome,
         side: order.side,
         orderId: order.orderId,
+        reason: "price_changed",
       });
     } catch (e) {
       console.error(`[MarketMaking] Failed to cancel order ${order.orderId}:`, e);
     }
   }
 
-  // Place new YES quotes
-  if (yesQuote.bidSize > 0) {
+  // Place new orders only for quotes that aren't already satisfied
+  if (yesQuote.bidSize > 0 && !satisfiedQuotes.has("YES-BID")) {
     const bidResult = await placeOrder({
       tokenId: yesTokenId,
       side: "BUY",
@@ -816,7 +901,7 @@ async function processMarketMaker(
     }
   }
 
-  if (yesQuote.askSize > 0) {
+  if (yesQuote.askSize > 0 && !satisfiedQuotes.has("YES-ASK")) {
     const askResult = await placeOrder({
       tokenId: yesTokenId,
       side: "SELL",
@@ -849,8 +934,8 @@ async function processMarketMaker(
     }
   }
 
-  // Place new NO quotes
-  if (noQuote.bidSize > 0) {
+  // Place new NO quotes only if not already satisfied
+  if (noQuote.bidSize > 0 && !satisfiedQuotes.has("NO-BID")) {
     const bidResult = await placeOrder({
       tokenId: noTokenId,
       side: "BUY",
@@ -883,7 +968,7 @@ async function processMarketMaker(
     }
   }
 
-  if (noQuote.askSize > 0) {
+  if (noQuote.askSize > 0 && !satisfiedQuotes.has("NO-ASK")) {
     const askResult = await placeOrder({
       tokenId: noTokenId,
       side: "SELL",
