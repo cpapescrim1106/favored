@@ -667,6 +667,7 @@ async function processMarketMaker(
     quotingPolicy: mm.quotingPolicy as QuotingPolicy,
     bestBid: yesBest.bestBid,
     bestAsk: yesBest.bestAsk,
+    avgCost: Number(mm.avgYesCost) || undefined,
   });
 
   const noQuote = calculateQuotes({
@@ -679,6 +680,7 @@ async function processMarketMaker(
     quotingPolicy: mm.quotingPolicy as QuotingPolicy,
     bestBid: noBest.bestBid,
     bestAsk: noBest.bestAsk,
+    avgCost: Number(mm.avgNoCost) || undefined,
   });
 
   console.log(`[MarketMaking] ${mm.market.slug} YES quotes:`, {

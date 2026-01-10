@@ -82,6 +82,8 @@ interface MarketMaker {
   avgYesCost: number;
   avgNoCost: number;
   realizedPnl: number;
+  unrealizedPnl: number;
+  totalPnl: number;
   minTimeToResolution: number;
   volatilityPauseUntil: string | null;
   orders: MarketMakerOrder[];
@@ -98,6 +100,10 @@ interface MarketMakingData {
     totalOpenOrders: number;
     marketsAtRisk: number;
     totalRealizedPnl: number;
+    totalUnrealizedPnl: number;
+    totalPnl: number;
+    totalAtRisk: number;
+    cashAvailable: number | null;
   };
   marketMakers: MarketMaker[];
 }
@@ -140,11 +146,11 @@ export default function MarketMakingPage() {
   const [selectedCandidate, setSelectedCandidate] = useState<MMCandidate | null>(null);
   const [dialogStep, setDialogStep] = useState<"select" | "configure">("select");
   const [formValues, setFormValues] = useState({
-    targetSpread: 0.02,
+    targetSpread: 0.04,
     orderSize: 100,
     maxInventory: 500,
-    skewFactor: 0.02,
-    quotingPolicy: "inside",
+    skewFactor: 0.04,
+    quotingPolicy: "touch",
     minTimeToResolution: 24,
   });
 
@@ -156,7 +162,9 @@ export default function MarketMakingPage() {
       if (!res.ok) throw new Error("Failed to fetch market makers");
       return res.json();
     },
-    refetchInterval: 10000,
+    refetchInterval: 3000,
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: true,
   });
 
   // Fetch MM candidates when dialog opens
@@ -254,10 +262,11 @@ export default function MarketMakingPage() {
 
   const handleSelectCandidate = (candidate: MMCandidate) => {
     setSelectedCandidate(candidate);
-    // Pre-fill spread based on current market spread
+    // Pre-fill spread: current spread + 1 tick buffer, minimum 4 ticks ($0.04)
+    // Note: targetSpread is absolute (e.g., 0.02 = $0.02 = 2 ticks), not a percentage
     setFormValues({
       ...formValues,
-      targetSpread: Math.max(0.02, candidate.spreadPercent * 1.5), // 1.5x current spread
+      targetSpread: Math.max(0.04, (candidate.spreadTicks + 1) * 0.01),
     });
     setDialogStep("configure");
   };
@@ -268,10 +277,19 @@ export default function MarketMakingPage() {
     totalOpenOrders: 0,
     marketsAtRisk: 0,
     totalRealizedPnl: 0,
+    totalUnrealizedPnl: 0,
+    totalPnl: 0,
+    totalAtRisk: 0,
+    cashAvailable: null,
   };
   const marketMakers = data?.marketMakers || [];
   const mmEnabled = data?.mmEnabled || false;
   const candidates = candidatesData?.candidates || [];
+  const totalDeployed = marketMakers.reduce((sum, mm) => {
+    const yesCost = mm.yesInventory * mm.avgYesCost;
+    const noCost = mm.noInventory * mm.avgNoCost;
+    return sum + yesCost + noCost;
+  }, 0);
 
   // Helper to get order by outcome and side
   const getOrder = (mm: MarketMaker, outcome: string, side: string) => {
@@ -383,7 +401,7 @@ export default function MarketMakingPage() {
                                   <div className="flex items-center gap-2 mt-1 text-xs text-zinc-500">
                                     <span>{candidate.category || "—"}</span>
                                     <span>·</span>
-                                    <span>${(candidate.volume24h / 1000).toFixed(0)}k vol</span>
+                                    <span>${candidate.volume24h >= 1000000 ? `${(candidate.volume24h / 1000000).toFixed(1)}M` : `${(candidate.volume24h / 1000).toFixed(0)}k`} vol</span>
                                     <span>·</span>
                                     <span>{candidate.spreadTicks} tick spread</span>
                                     {candidate.hoursToEnd && (
@@ -458,12 +476,13 @@ export default function MarketMakingPage() {
 
                     <div className="grid grid-cols-2 gap-4">
                       <div className="grid gap-2">
-                        <Label htmlFor="targetSpread">Target Spread (%)</Label>
+                        <Label htmlFor="targetSpread">Target Spread (¢)</Label>
                         <Input
                           id="targetSpread"
                           type="number"
-                          step="0.1"
-                          value={(formValues.targetSpread * 100).toFixed(1)}
+                          step="1"
+                          min="1"
+                          value={(formValues.targetSpread * 100).toFixed(0)}
                           onChange={(e) =>
                             setFormValues({
                               ...formValues,
@@ -578,7 +597,54 @@ export default function MarketMakingPage() {
       </div>
 
       {/* Summary Metrics */}
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-4">
+        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+          <div className="text-xs text-zinc-500 uppercase">Cash Available</div>
+          <div className="text-2xl font-bold">
+            {summary.cashAvailable !== null
+              ? `$${summary.cashAvailable >= 1000 ? `${(summary.cashAvailable / 1000).toFixed(1)}k` : summary.cashAvailable.toFixed(0)}`
+              : "—"}
+          </div>
+        </div>
+        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+          <div className="text-xs text-zinc-500 uppercase">Net Risk</div>
+          <div className={`text-2xl font-bold ${summary.totalAtRisk > 0 ? "text-amber-600" : ""}`}>
+            ${summary.totalAtRisk >= 1000 ? `${(summary.totalAtRisk / 1000).toFixed(1)}k` : summary.totalAtRisk.toFixed(0)}
+          </div>
+          <div className="text-xs text-zinc-500 mt-1">
+            {summary.marketsAtRisk > 0 && `${summary.marketsAtRisk} near max inv`}
+          </div>
+        </div>
+        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+          <div className="text-xs text-zinc-500 uppercase">Capital Deployed</div>
+          <div className="text-2xl font-bold">
+            ${totalDeployed >= 1000 ? `${(totalDeployed / 1000).toFixed(1)}k` : totalDeployed.toFixed(0)}
+          </div>
+        </div>
+        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+          <div className="text-xs text-zinc-500 uppercase">Total P&L</div>
+          <div
+            className={`text-2xl font-bold flex items-center gap-1 ${
+              summary.totalPnl >= 0 ? "text-green-600" : "text-red-600"
+            }`}
+          >
+            {summary.totalPnl >= 0 ? (
+              <TrendingUp className="h-5 w-5" />
+            ) : (
+              <TrendingDown className="h-5 w-5" />
+            )}
+            ${Math.abs(summary.totalPnl).toFixed(2)}
+          </div>
+          <div className="text-xs text-zinc-500 mt-1">
+            <span className={summary.totalRealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
+              ${summary.totalRealizedPnl >= 0 ? "+" : ""}{summary.totalRealizedPnl.toFixed(2)} real
+            </span>
+            {" / "}
+            <span className={summary.totalUnrealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
+              ${summary.totalUnrealizedPnl >= 0 ? "+" : ""}{summary.totalUnrealizedPnl.toFixed(2)} unreal
+            </span>
+          </div>
+        </div>
         <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
           <div className="text-xs text-zinc-500 uppercase">Active Makers</div>
           <div className="text-2xl font-bold">{summary.active}</div>
@@ -586,27 +652,6 @@ export default function MarketMakingPage() {
         <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
           <div className="text-xs text-zinc-500 uppercase">Open Orders</div>
           <div className="text-2xl font-bold">{summary.totalOpenOrders}</div>
-        </div>
-        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
-          <div className="text-xs text-zinc-500 uppercase">At Risk</div>
-          <div className={`text-2xl font-bold ${summary.marketsAtRisk > 0 ? "text-amber-600" : ""}`}>
-            {summary.marketsAtRisk}
-          </div>
-        </div>
-        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
-          <div className="text-xs text-zinc-500 uppercase">Realized P&L</div>
-          <div
-            className={`text-2xl font-bold flex items-center gap-1 ${
-              summary.totalRealizedPnl >= 0 ? "text-green-600" : "text-red-600"
-            }`}
-          >
-            {summary.totalRealizedPnl >= 0 ? (
-              <TrendingUp className="h-5 w-5" />
-            ) : (
-              <TrendingDown className="h-5 w-5" />
-            )}
-            ${Math.abs(summary.totalRealizedPnl).toFixed(2)}
-          </div>
         </div>
         <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
           <div className="text-xs text-zinc-500 uppercase">Status</div>
@@ -627,8 +672,11 @@ export default function MarketMakingPage() {
               <TableHead>Status</TableHead>
               <TableHead className="text-right">YES Bid</TableHead>
               <TableHead className="text-right">YES Ask</TableHead>
+              <TableHead className="text-right">NO Bid</TableHead>
+              <TableHead className="text-right">NO Ask</TableHead>
               <TableHead className="text-right">YES Inv</TableHead>
               <TableHead className="text-right">NO Inv</TableHead>
+              <TableHead className="text-right">Deployed</TableHead>
               <TableHead className="text-right">P&L</TableHead>
               <TableHead className="text-right">Fills</TableHead>
               <TableHead className="text-right">Actions</TableHead>
@@ -638,7 +686,7 @@ export default function MarketMakingPage() {
             {isLoading ? (
               Array.from({ length: 3 }).map((_, i) => (
                 <TableRow key={i}>
-                  <TableCell colSpan={9}>
+                  <TableCell colSpan={12}>
                     <Skeleton className="h-4 w-full" />
                   </TableCell>
                 </TableRow>
@@ -646,7 +694,7 @@ export default function MarketMakingPage() {
             ) : marketMakers.length === 0 ? (
               <TableRow>
                 <TableCell
-                  colSpan={9}
+                  colSpan={12}
                   className="text-center py-12 text-zinc-500"
                 >
                   <BarChart3 className="h-12 w-12 mx-auto mb-2 opacity-20" />
@@ -658,7 +706,10 @@ export default function MarketMakingPage() {
               marketMakers.map((mm) => {
                 const yesBid = getOrder(mm, "YES", "BID");
                 const yesAsk = getOrder(mm, "YES", "ASK");
+                const noBid = getOrder(mm, "NO", "BID");
+                const noAsk = getOrder(mm, "NO", "ASK");
                 const volatilityPaused = isVolatilityPaused(mm);
+                const deployed = mm.yesInventory * mm.avgYesCost + mm.noInventory * mm.avgNoCost;
 
                 return (
                   <TableRow
@@ -681,6 +732,21 @@ export default function MarketMakingPage() {
                           <span className="text-zinc-400">·</span>
                           <span>{mm.quotingPolicy}</span>
                         </div>
+                        <div className="text-xs text-zinc-500 flex items-center gap-2">
+                          <span>
+                            {mm.market?.endDate
+                              ? `Ends ${formatDistanceToNow(new Date(mm.market.endDate), { addSuffix: true })}`
+                              : "End date —"}
+                          </span>
+                          <span className="text-zinc-400">·</span>
+                          <span>
+                            Yes {mm.market?.yesPrice != null ? `$${mm.market.yesPrice.toFixed(2)}` : "—"}
+                          </span>
+                          <span>/</span>
+                          <span>
+                            No {mm.market?.noPrice != null ? `$${mm.market.noPrice.toFixed(2)}` : "—"}
+                          </span>
+                        </div>
                       </div>
                     </TableCell>
                     <TableCell>
@@ -700,10 +766,36 @@ export default function MarketMakingPage() {
                       </div>
                     </TableCell>
                     <TableCell className="text-right font-mono text-green-600">
-                      {yesBid ? `$${yesBid.price.toFixed(2)}` : "—"}
+                      {yesBid ? (
+                        <div>
+                          <div>${yesBid.price.toFixed(2)}</div>
+                          <div className="text-xs text-zinc-500">{yesBid.size}</div>
+                        </div>
+                      ) : "—"}
                     </TableCell>
                     <TableCell className="text-right font-mono text-red-600">
-                      {yesAsk ? `$${yesAsk.price.toFixed(2)}` : "—"}
+                      {yesAsk ? (
+                        <div>
+                          <div>${yesAsk.price.toFixed(2)}</div>
+                          <div className="text-xs text-zinc-500">{yesAsk.size}</div>
+                        </div>
+                      ) : "—"}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-green-600">
+                      {noBid ? (
+                        <div>
+                          <div>${noBid.price.toFixed(2)}</div>
+                          <div className="text-xs text-zinc-500">{noBid.size}</div>
+                        </div>
+                      ) : "—"}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-red-600">
+                      {noAsk ? (
+                        <div>
+                          <div>${noAsk.price.toFixed(2)}</div>
+                          <div className="text-xs text-zinc-500">{noAsk.size}</div>
+                        </div>
+                      ) : "—"}
                     </TableCell>
                     <TableCell className="text-right font-mono">
                       <span className="text-green-600">{mm.yesInventory.toFixed(1)}</span>
@@ -721,12 +813,20 @@ export default function MarketMakingPage() {
                         </div>
                       )}
                     </TableCell>
+                    <TableCell className="text-right font-mono">
+                      ${deployed.toFixed(2)}
+                    </TableCell>
                     <TableCell
-                      className={`text-right font-mono font-bold ${
-                        mm.realizedPnl >= 0 ? "text-green-600" : "text-red-600"
+                      className={`text-right font-mono ${
+                        mm.totalPnl >= 0 ? "text-green-600" : "text-red-600"
                       }`}
                     >
-                      ${mm.realizedPnl.toFixed(2)}
+                      <div className="font-bold">${mm.totalPnl.toFixed(2)}</div>
+                      <div className="text-xs opacity-70">
+                        {deployed > 0
+                          ? `${mm.totalPnl >= 0 ? "+" : ""}${((mm.totalPnl / deployed) * 100).toFixed(1)}%`
+                          : "—"}
+                      </div>
                     </TableCell>
                     <TableCell className="text-right text-sm">
                       {mm.fillCount}
@@ -804,12 +904,13 @@ export default function MarketMakingPage() {
           <div className="grid gap-4 py-4">
             <div className="grid grid-cols-2 gap-4">
               <div className="grid gap-2">
-                <Label htmlFor="edit-targetSpread">Target Spread (%)</Label>
+                <Label htmlFor="edit-targetSpread">Target Spread (¢)</Label>
                 <Input
                   id="edit-targetSpread"
                   type="number"
-                  step="0.1"
-                  value={(formValues.targetSpread * 100).toFixed(1)}
+                  step="1"
+                  min="1"
+                  value={(formValues.targetSpread * 100).toFixed(0)}
                   onChange={(e) =>
                     setFormValues({
                       ...formValues,

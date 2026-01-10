@@ -28,6 +28,7 @@ export interface QuoteParams {
   quotingPolicy?: QuotingPolicy; // Where to place quotes
   bestBid?: number; // Current best bid (for policy)
   bestAsk?: number; // Current best ask (for policy)
+  avgCost?: number; // Average cost of inventory (for aggressive sell sizing)
 }
 
 export interface Quote {
@@ -120,6 +121,16 @@ export function calculateQuotes(params: QuoteParams): Quote {
   // Polymarket doesn't allow selling tokens you don't own
   if (inventory <= 0) {
     askSize = 0; // No inventory = no selling
+  } else {
+    // Aggressive sell sizing when profitable or high exposure
+    const isProfitable = params.avgCost !== undefined && midPrice >= params.avgCost;
+    const isHighExposure = Math.abs(invNorm) >= 0.7;
+
+    if (isProfitable || isHighExposure) {
+      // Sell more aggressively: max of 3x order size or 50% of inventory
+      const aggressiveSize = Math.max(orderSize * 3, inventory * 0.5);
+      askSize = Math.min(inventory, aggressiveSize);
+    }
   }
 
   if (reduceOnly) {
