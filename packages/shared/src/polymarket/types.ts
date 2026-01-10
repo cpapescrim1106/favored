@@ -60,6 +60,8 @@ export interface GammaMarket {
   tags?: GammaTag[];
   // Legacy field - may not exist in new API
   tokens?: GammaToken[];
+  // CLOB token IDs for orderbook access (JSON string: '["token1", "token2"]')
+  clobTokenIds?: string;
 }
 
 export interface GammaEvent {
@@ -101,6 +103,39 @@ export interface CLOBPosition {
   size: string;
   average_price: string;
   side: "YES" | "NO";
+}
+
+/**
+ * Position data from Polymarket Data API
+ * GET https://data-api.polymarket.com/positions
+ */
+export interface DataAPIPosition {
+  proxyWallet: string;
+  asset: string;
+  conditionId: string;
+  size: number;
+  avgPrice: number;
+  initialValue: number;
+  currentValue: number;
+  cashPnl: number;
+  percentPnl: number;
+  totalBought: number;
+  realizedPnl: number;
+  percentRealizedPnl: number;
+  curPrice: number;
+  redeemable: boolean;
+  mergeable: boolean;
+  title: string;
+  slug: string;
+  icon: string;
+  eventId: string;
+  eventSlug: string;
+  outcome: "Yes" | "No";
+  outcomeIndex: number;
+  oppositeOutcome: string;
+  oppositeAsset: string;
+  endDate: string;
+  negativeRisk: boolean;
 }
 
 export type OrderType = "GTC" | "GTD" | "FOK" | "FAK";

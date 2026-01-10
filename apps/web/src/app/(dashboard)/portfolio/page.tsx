@@ -40,7 +40,7 @@ interface Position {
   unrealizedPnl: number | null;
   takeProfitPrice: number | null;
   status: string;
-  openedAt: string;
+  openedAt: string | null;
   market: {
     slug: string;
     eventSlug: string | null;
@@ -52,7 +52,7 @@ interface Position {
 }
 
 export default function PortfolioPage() {
-  // Fetch positions
+  // Fetch portfolio data (includes positions and cash balance)
   const { data, isLoading } = useQuery({
     queryKey: ["portfolio"],
     queryFn: async () => {
@@ -61,17 +61,6 @@ export default function PortfolioPage() {
       return res.json();
     },
     refetchInterval: 30000, // Refresh every 30 seconds
-  });
-
-  // Fetch cash balance
-  const { data: balanceData } = useQuery({
-    queryKey: ["balance"],
-    queryFn: async () => {
-      const res = await fetch("/api/clob/balance");
-      if (!res.ok) return null;
-      return res.json();
-    },
-    refetchInterval: 30000,
   });
 
   const positions: Position[] = data?.positions || [];
@@ -89,10 +78,8 @@ export default function PortfolioPage() {
     closedCount: 0,
   };
 
-  // Cash balance (USDC in wallet)
-  const cashBalance = balanceData?.balance
-    ? parseFloat(balanceData.balance) / 1e6
-    : 0;
+  // Cash balance (USDC in wallet) - now included in portfolio response
+  const cashBalance = data?.cashBalance ?? 0;
 
   // Combined metrics
   const totalPnl = summary.unrealizedPnl + closedSummary.realizedPnl;
@@ -379,9 +366,11 @@ export default function PortfolioPage() {
                         </span>
                       </TableCell>
                       <TableCell className="text-right text-sm text-zinc-500">
-                        {formatDistanceToNow(new Date(position.openedAt), {
-                          addSuffix: true,
-                          })}
+                        {position.openedAt
+                          ? formatDistanceToNow(new Date(position.openedAt), {
+                              addSuffix: true,
+                            })
+                          : "—"}
                         </TableCell>
                       </TableRow>
                     ))
