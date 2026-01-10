@@ -28,11 +28,15 @@ import {
 } from "@favored/shared";
 import {
   calculateQuotes,
+  calculateTieredQuotes,
+  parseTierConfig,
   calculateMidPrice,
   shouldRefreshQuotes,
   TICK_SIZE,
   type Quote,
   type QuotingPolicy,
+  type TieredQuote,
+  type TierConfig,
 } from "@favored/shared";
 import { addHours, isBefore } from "date-fns";
 
@@ -200,10 +204,6 @@ async function checkAllFills(
       if (!("orders" in mm) || !Array.isArray(mm.orders)) continue;
 
       for (const order of mm.orders) {
-        // If order is still open, nothing to do
-        if (openOrderIds.has(order.orderId)) continue;
-
-        // Order is not in open orders - check if it was actually filled
         const orderResult = await getOrder(order.orderId);
 
         if (orderResult.status === "error") {
@@ -232,24 +232,65 @@ async function checkAllFills(
         const originalSize = Number(orderDetails.original_size || order.size);
         const isLive = status === "LIVE" || status === "OPEN";
         const isTerminal = status === "MATCHED" || status === "CANCELLED" || status === "EXPIRED";
+        const previousMatched =
+          order.lastMatchedSize === null || order.lastMatchedSize === undefined
+            ? null
+            : Number(order.lastMatchedSize);
 
-        if (isLive) {
-          console.warn(
-            `[MarketMaking] Order ${order.orderId} reported ${status} but missing from open orders; keeping record`
-          );
+        if (previousMatched === null) {
+          await prisma.marketMakerOrder.update({
+            where: { id: order.id },
+            data: { lastMatchedSize: sizeMatched },
+          });
+
+          if (isTerminal) {
+            console.log(
+              `[MarketMaking] Order ${order.orderId} ${status.toLowerCase()} before baseline`
+            );
+            await prisma.marketMakerOrder.delete({ where: { id: order.id } });
+            await logQuoteAction(mm.id, "ORDER_CANCELLED", {
+              outcome: order.outcome,
+              side: order.side,
+              orderId: order.orderId,
+              status,
+              note: "Baseline before processing partial fills",
+            });
+          }
           continue;
         }
 
-        if (sizeMatched > 0) {
-          // Order was (at least partially) filled - process the fill
-          console.log(`[MarketMaking] Order ${order.orderId} filled: ${sizeMatched}/${originalSize}`);
-          await processFill(mm, order, result, sizeMatched);
-          continue;
+        if (sizeMatched > previousMatched) {
+          const deltaMatched = sizeMatched - previousMatched;
+          console.log(
+            `[MarketMaking] Order ${order.orderId} filled: ${deltaMatched}/${originalSize} (total ${sizeMatched})`
+          );
+          await processFill(mm, order, result, deltaMatched, false);
+          await prisma.marketMakerOrder.update({
+            where: { id: order.id },
+            data: { lastMatchedSize: sizeMatched },
+          });
+          if (isLive) {
+            await logQuoteAction(mm.id, "PARTIAL_FILL", {
+              outcome: order.outcome,
+              side: order.side,
+              orderId: order.orderId,
+              filledSize: deltaMatched,
+              totalMatched: sizeMatched,
+              originalSize,
+            });
+          }
         }
 
         if (isTerminal) {
           // Cancelled/expired/fully matched without any fills - delete record
-          console.log(`[MarketMaking] Order ${order.orderId} ${status.toLowerCase()} (no fills)`);
+          if (sizeMatched > 0 && sizeMatched > previousMatched) {
+            // Already processed delta above, but keep log context for terminal close
+            console.log(
+              `[MarketMaking] Order ${order.orderId} ${status.toLowerCase()} after fills`
+            );
+          } else {
+            console.log(`[MarketMaking] Order ${order.orderId} ${status.toLowerCase()} (no fills)`);
+          }
           await prisma.marketMakerOrder.delete({ where: { id: order.id } });
           await logQuoteAction(mm.id, "ORDER_CANCELLED", {
             outcome: order.outcome,
@@ -257,6 +298,15 @@ async function checkAllFills(
             orderId: order.orderId,
             status,
           });
+          continue;
+        }
+
+        if (isLive) {
+          if (!openOrderIds.has(order.orderId)) {
+            console.warn(
+              `[MarketMaking] Order ${order.orderId} reported ${status} but missing from open orders; keeping record`
+            );
+          }
           continue;
         }
 
@@ -273,13 +323,15 @@ async function checkAllFills(
 
 /**
  * Process a fill for an order
- * @param filledSize - Actual size that was filled (from getOrder size_matched)
+ * @param filledSize - Actual size that was filled (delta for partial fills)
+ * @param finalizeOrder - Whether to delete the order record after processing
  */
 async function processFill(
   mm: { id: string; yesInventory: unknown; noInventory: unknown; avgYesCost: unknown; avgNoCost: unknown; realizedPnl: unknown },
   order: { id: string; orderId: string; outcome: string; side: string; price: unknown; size: unknown },
   result: MarketMakingResult,
-  filledSize?: number
+  filledSize?: number,
+  finalizeOrder = true
 ): Promise<void> {
   const isBuy = order.side === "BID";
   const isYes = order.outcome === "YES";
@@ -378,10 +430,12 @@ async function processFill(
     },
   });
 
-  // Delete the filled order
-  await prisma.marketMakerOrder.delete({
-    where: { id: order.id },
-  });
+  if (finalizeOrder) {
+    // Delete the filled order
+    await prisma.marketMakerOrder.delete({
+      where: { id: order.id },
+    });
+  }
 
   // Log the fill
   await logQuoteAction(mm.id, "FILL", {
@@ -665,8 +719,8 @@ async function processMarketMaker(
     orderSize: Number(mm.orderSize),
     maxInventory: Number(mm.maxInventory),
     quotingPolicy: mm.quotingPolicy as QuotingPolicy,
-    bestBid: yesBest.bestBid,
-    bestAsk: yesBest.bestAsk,
+    bestBid: yesBest.bestBid ?? undefined,
+    bestAsk: yesBest.bestAsk ?? undefined,
     avgCost: Number(mm.avgYesCost) || undefined,
   });
 
@@ -678,8 +732,8 @@ async function processMarketMaker(
     orderSize: Number(mm.orderSize),
     maxInventory: Number(mm.maxInventory),
     quotingPolicy: mm.quotingPolicy as QuotingPolicy,
-    bestBid: noBest.bestBid,
-    bestAsk: noBest.bestAsk,
+    bestBid: noBest.bestBid ?? undefined,
+    bestAsk: noBest.bestAsk ?? undefined,
     avgCost: Number(mm.avgNoCost) || undefined,
   });
 
@@ -701,6 +755,74 @@ async function processMarketMaker(
     reduceOnly: noQuote.reduceOnly,
     inventory: Number(mm.noInventory).toFixed(2),
   });
+
+  // For tiered quoting, calculate tiered quotes and convert to uniform format
+  // For non-tiered, convert single quotes to the same format
+  const isTiered = mm.quotingPolicy === "tiered" && config.mmTierCount > 1;
+  let allYesQuotes: TieredQuote[] = [];
+  let allNoQuotes: TieredQuote[] = [];
+
+  if (isTiered) {
+    const tierConfig = parseTierConfig(
+      config.mmTierBidOffsets,
+      config.mmTierAskOffsets,
+      config.mmTierSizes
+    );
+
+    console.log(`[MarketMaking] ${mm.market.slug} using tiered quoting:`, tierConfig);
+
+    // For tiered quoting, we need actual best bid/ask values
+    // Fall back to mid price if not available
+    const yesBestBid = yesBest.bestBid ?? currentYesMidPrice - TICK_SIZE;
+    const yesBestAsk = yesBest.bestAsk ?? currentYesMidPrice + TICK_SIZE;
+    const noBestBid = noBest.bestBid ?? currentNoMidPrice - TICK_SIZE;
+    const noBestAsk = noBest.bestAsk ?? currentNoMidPrice + TICK_SIZE;
+
+    allYesQuotes = calculateTieredQuotes(
+      {
+        midPrice: currentYesMidPrice,
+        targetSpread: Number(mm.targetSpread),
+        inventory: Number(mm.yesInventory),
+        skewFactor: Number(mm.skewFactor),
+        orderSize: Number(mm.orderSize),
+        maxInventory: Number(mm.maxInventory),
+        bestBid: yesBestBid,
+        bestAsk: yesBestAsk,
+      },
+      tierConfig
+    );
+
+    allNoQuotes = calculateTieredQuotes(
+      {
+        midPrice: currentNoMidPrice,
+        targetSpread: Number(mm.targetSpread),
+        inventory: Number(mm.noInventory),
+        skewFactor: Number(mm.skewFactor),
+        orderSize: Number(mm.orderSize),
+        maxInventory: Number(mm.maxInventory),
+        bestBid: noBestBid,
+        bestAsk: noBestAsk,
+      },
+      tierConfig
+    );
+
+    console.log(`[MarketMaking] ${mm.market.slug} YES tiered quotes:`, allYesQuotes);
+    console.log(`[MarketMaking] ${mm.market.slug} NO tiered quotes:`, allNoQuotes);
+  } else {
+    // Convert single quotes to tiered format for uniform handling
+    if (yesQuote.bidSize > 0) {
+      allYesQuotes.push({ tier: 0, side: "BID", price: yesQuote.bidPrice, size: yesQuote.bidSize });
+    }
+    if (yesQuote.askSize > 0) {
+      allYesQuotes.push({ tier: 0, side: "ASK", price: yesQuote.askPrice, size: yesQuote.askSize });
+    }
+    if (noQuote.bidSize > 0) {
+      allNoQuotes.push({ tier: 0, side: "BID", price: noQuote.bidPrice, size: noQuote.bidSize });
+    }
+    if (noQuote.askSize > 0) {
+      allNoQuotes.push({ tier: 0, side: "ASK", price: noQuote.askPrice, size: noQuote.askSize });
+    }
+  }
 
   // CHECK 6: Quote prices must be reasonable relative to best bid/ask
   // Don't improve the best bid/ask by more than MAX_QUOTE_IMPROVEMENT (prevents runaway quotes)
@@ -817,35 +939,46 @@ async function processMarketMaker(
     return;
   }
 
-  // Build map of desired quotes: key = "outcome-side", value = {price, size, tokenId}
-  const desiredQuotes = new Map<string, { price: number; size: number; tokenId: string }>();
+  // Build map of desired quotes: key = "outcome-side-tier", value = {price, size, tokenId, tier}
+  const desiredQuotes = new Map<string, { price: number; size: number; tokenId: string; tier: number }>();
 
-  if (yesQuote.bidSize > 0) {
-    desiredQuotes.set("YES-BID", { price: yesQuote.bidPrice, size: yesQuote.bidSize, tokenId: yesTokenId });
+  for (const quote of allYesQuotes) {
+    if (quote.size > 0) {
+      const key = `YES-${quote.side}-${quote.tier}`;
+      desiredQuotes.set(key, { price: quote.price, size: quote.size, tokenId: yesTokenId, tier: quote.tier });
+    }
   }
-  if (yesQuote.askSize > 0) {
-    desiredQuotes.set("YES-ASK", { price: yesQuote.askPrice, size: yesQuote.askSize, tokenId: yesTokenId });
-  }
-  if (noQuote.bidSize > 0) {
-    desiredQuotes.set("NO-BID", { price: noQuote.bidPrice, size: noQuote.bidSize, tokenId: noTokenId });
-  }
-  if (noQuote.askSize > 0) {
-    desiredQuotes.set("NO-ASK", { price: noQuote.askPrice, size: noQuote.askSize, tokenId: noTokenId });
+  for (const quote of allNoQuotes) {
+    if (quote.size > 0) {
+      const key = `NO-${quote.side}-${quote.tier}`;
+      desiredQuotes.set(key, { price: quote.price, size: quote.size, tokenId: noTokenId, tier: quote.tier });
+    }
   }
 
   // Track which desired quotes are already satisfied by existing orders
   const satisfiedQuotes = new Set<string>();
   const ordersToCancel: typeof existingOrders = [];
 
-  // Check existing orders against desired quotes
+  // Check existing orders against desired quotes (now includes tier in key)
   for (const order of existingOrders) {
-    const key = `${order.outcome}-${order.side}`;
+    const tier = order.tier ?? 0;
+    const key = `${order.outcome}-${order.side}-${tier}`;
     const desired = desiredQuotes.get(key);
 
     if (desired && Math.abs(Number(order.price) - desired.price) < 0.001) {
-      // Order is at the correct price - keep it to maintain queue priority
-      satisfiedQuotes.add(key);
-      console.log(`[MarketMaking] Keeping ${key} order at ${order.price} (queue priority)`);
+      // Price matches - check if size is close enough to keep for queue priority
+      const sizeDiff = Math.abs(Number(order.size) - desired.size);
+      const sizeRatio = desired.size > 0 ? sizeDiff / desired.size : 0;
+
+      if (sizeRatio < 0.2) {
+        // Size within 20% - keep order for queue priority
+        satisfiedQuotes.add(key);
+        console.log(`[MarketMaking] Keeping ${key} order at ${order.price} x ${order.size} (queue priority)`);
+      } else {
+        // Size changed significantly - replace order
+        console.log(`[MarketMaking] Replacing ${key}: size ${order.size} → ${desired.size}`);
+        ordersToCancel.push(order);
+      }
     } else {
       // Price changed or quote no longer needed - cancel it
       ordersToCancel.push(order);
@@ -869,136 +1002,46 @@ async function processMarketMaker(
     }
   }
 
-  // Place new orders only for quotes that aren't already satisfied
-  if (yesQuote.bidSize > 0 && !satisfiedQuotes.has("YES-BID")) {
-    const bidResult = await placeOrder({
-      tokenId: yesTokenId,
-      side: "BUY",
-      price: yesQuote.bidPrice,
-      size: yesQuote.bidSize,
+  // Place new orders for quotes that aren't already satisfied
+  for (const [key, desired] of desiredQuotes) {
+    if (satisfiedQuotes.has(key)) continue;
+
+    // Parse the key: "OUTCOME-SIDE-TIER" (e.g., "YES-BID-0", "NO-ASK-1")
+    const [outcome, side, tierStr] = key.split("-");
+    const tier = parseInt(tierStr, 10);
+    const orderSide = side === "BID" ? "BUY" : "SELL";
+
+    const orderResult = await placeOrder({
+      tokenId: desired.tokenId,
+      side: orderSide as "BUY" | "SELL",
+      price: desired.price,
+      size: desired.size,
       orderType: "GTC",
       postOnly: true,
     });
 
-    if (bidResult.success && bidResult.orderId) {
+    if (orderResult.success && orderResult.orderId) {
       await prisma.marketMakerOrder.create({
         data: {
           marketMakerId: mm.id,
-          outcome: "YES",
-          side: "BID",
-          orderId: bidResult.orderId,
-          tokenId: yesTokenId,
-          price: yesQuote.bidPrice,
-          size: yesQuote.bidSize,
+          outcome,
+          side,
+          tier,
+          orderId: orderResult.orderId,
+          tokenId: desired.tokenId,
+          price: desired.price,
+          size: desired.size,
+          lastMatchedSize: 0,
         },
       });
       result.quotesPlaced++;
       await logQuoteAction(mm.id, "QUOTE_PLACED", {
-        outcome: "YES",
-        side: "BID",
-        price: yesQuote.bidPrice,
-        size: yesQuote.bidSize,
-        orderId: bidResult.orderId,
-      });
-    }
-  }
-
-  if (yesQuote.askSize > 0 && !satisfiedQuotes.has("YES-ASK")) {
-    const askResult = await placeOrder({
-      tokenId: yesTokenId,
-      side: "SELL",
-      price: yesQuote.askPrice,
-      size: yesQuote.askSize,
-      orderType: "GTC",
-      postOnly: true,
-    });
-
-    if (askResult.success && askResult.orderId) {
-      await prisma.marketMakerOrder.create({
-        data: {
-          marketMakerId: mm.id,
-          outcome: "YES",
-          side: "ASK",
-          orderId: askResult.orderId,
-          tokenId: yesTokenId,
-          price: yesQuote.askPrice,
-          size: yesQuote.askSize,
-        },
-      });
-      result.quotesPlaced++;
-      await logQuoteAction(mm.id, "QUOTE_PLACED", {
-        outcome: "YES",
-        side: "ASK",
-        price: yesQuote.askPrice,
-        size: yesQuote.askSize,
-        orderId: askResult.orderId,
-      });
-    }
-  }
-
-  // Place new NO quotes only if not already satisfied
-  if (noQuote.bidSize > 0 && !satisfiedQuotes.has("NO-BID")) {
-    const bidResult = await placeOrder({
-      tokenId: noTokenId,
-      side: "BUY",
-      price: noQuote.bidPrice,
-      size: noQuote.bidSize,
-      orderType: "GTC",
-      postOnly: true,
-    });
-
-    if (bidResult.success && bidResult.orderId) {
-      await prisma.marketMakerOrder.create({
-        data: {
-          marketMakerId: mm.id,
-          outcome: "NO",
-          side: "BID",
-          orderId: bidResult.orderId,
-          tokenId: noTokenId,
-          price: noQuote.bidPrice,
-          size: noQuote.bidSize,
-        },
-      });
-      result.quotesPlaced++;
-      await logQuoteAction(mm.id, "QUOTE_PLACED", {
-        outcome: "NO",
-        side: "BID",
-        price: noQuote.bidPrice,
-        size: noQuote.bidSize,
-        orderId: bidResult.orderId,
-      });
-    }
-  }
-
-  if (noQuote.askSize > 0 && !satisfiedQuotes.has("NO-ASK")) {
-    const askResult = await placeOrder({
-      tokenId: noTokenId,
-      side: "SELL",
-      price: noQuote.askPrice,
-      size: noQuote.askSize,
-      orderType: "GTC",
-      postOnly: true,
-    });
-
-    if (askResult.success && askResult.orderId) {
-      await prisma.marketMakerOrder.create({
-        data: {
-          marketMakerId: mm.id,
-          outcome: "NO",
-          side: "ASK",
-          orderId: askResult.orderId,
-          tokenId: noTokenId,
-          price: noQuote.askPrice,
-          size: noQuote.askSize,
-        },
-      });
-      result.quotesPlaced++;
-      await logQuoteAction(mm.id, "QUOTE_PLACED", {
-        outcome: "NO",
-        side: "ASK",
-        price: noQuote.askPrice,
-        size: noQuote.askSize,
-        orderId: askResult.orderId,
+        outcome,
+        side,
+        tier,
+        price: desired.price,
+        size: desired.size,
+        orderId: orderResult.orderId,
       });
     }
   }
@@ -1038,12 +1081,16 @@ async function logQuoteAction(
   data: {
     outcome?: string;
     side?: string;
+    tier?: number;
     price?: number;
     size?: number;
     orderId?: string;
     error?: string;
     reason?: string;
     realizedPnl?: number | null;
+    status?: string;
+    filledSize?: number;
+    [key: string]: unknown;
   }
 ): Promise<void> {
   await prisma.quoteHistory.create({

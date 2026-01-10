@@ -16,7 +16,7 @@ export const TICK_SIZE = 0.01;
 export const MIN_PRICE = 0.01;
 export const MAX_PRICE = 0.99;
 
-export type QuotingPolicy = "touch" | "inside" | "back" | "defensive";
+export type QuotingPolicy = "touch" | "inside" | "back" | "defensive" | "tiered";
 
 export interface QuoteParams {
   midPrice: number;
@@ -37,6 +37,23 @@ export interface Quote {
   bidSize: number;
   askSize: number;
   reduceOnly: boolean; // True if near inventory cap
+}
+
+// ============================================================================
+// TIERED QUOTING
+// ============================================================================
+
+export interface TierConfig {
+  bidOffsets: number[]; // Cents behind best bid [1, 2] = 1¢ and 2¢ behind
+  askOffsets: number[]; // Cents behind best ask [0, 1] = at best and 1¢ behind
+  sizes: number[]; // Size % per tier [0.5, 0.5] = 50% each
+}
+
+export interface TieredQuote {
+  tier: number;
+  side: "BID" | "ASK";
+  price: number;
+  size: number;
 }
 
 /**
@@ -154,6 +171,111 @@ export function calculateQuotes(params: QuoteParams): Quote {
   }
 
   return { bidPrice, askPrice, bidSize, askSize, reduceOnly };
+}
+
+/**
+ * Calculate tiered quotes - multiple price levels per side.
+ *
+ * Places orders at multiple price levels to:
+ * - Build queue priority at different levels
+ * - Capture flow at various price points
+ * - Average into/out of positions more gradually
+ *
+ * @param params Base quote parameters (same as calculateQuotes)
+ * @param tierConfig Configuration for tier offsets and sizes
+ * @returns Array of tiered quotes for both BID and ASK sides
+ */
+export function calculateTieredQuotes(
+  params: QuoteParams & { bestBid: number; bestAsk: number },
+  tierConfig: TierConfig
+): TieredQuote[] {
+  const { bestBid, bestAsk, orderSize, inventory, maxInventory } = params;
+
+  const quotes: TieredQuote[] = [];
+  const invNorm = Math.max(-1, Math.min(1, inventory / maxInventory));
+  const reduceOnly = Math.abs(invNorm) >= 0.9;
+
+  // Calculate total bid size (same as single quote logic)
+  let totalBidSize = orderSize;
+  if (reduceOnly && invNorm >= 0.9) {
+    totalBidSize = 0; // Don't buy when at max long
+  }
+
+  // Calculate total ask size (same as single quote logic)
+  let totalAskSize = orderSize;
+  if (inventory <= 0) {
+    totalAskSize = 0; // No inventory = no selling
+  } else {
+    // Aggressive sizing for sells
+    const aggressiveSize = Math.max(orderSize * 3, inventory * 0.5);
+    totalAskSize = Math.min(inventory, aggressiveSize);
+  }
+  if (reduceOnly && invNorm <= -0.9) {
+    totalAskSize = 0; // Don't sell when at max short
+  }
+
+  // Generate BID tiers
+  if (totalBidSize > 0) {
+    for (let i = 0; i < tierConfig.bidOffsets.length; i++) {
+      const offset = tierConfig.bidOffsets[i];
+      const sizePercent = tierConfig.sizes[i] ?? (1 / tierConfig.bidOffsets.length);
+
+      // Price = bestBid - offset (in cents, so multiply by TICK_SIZE)
+      let price = bestBid - offset * TICK_SIZE;
+      price = roundToTick(clampPrice(price));
+
+      const size = Math.round(totalBidSize * sizePercent * 100) / 100; // Round to 2 decimals
+
+      if (size > 0 && price > 0) {
+        quotes.push({
+          tier: i,
+          side: "BID",
+          price,
+          size,
+        });
+      }
+    }
+  }
+
+  // Generate ASK tiers
+  if (totalAskSize > 0) {
+    for (let i = 0; i < tierConfig.askOffsets.length; i++) {
+      const offset = tierConfig.askOffsets[i];
+      const sizePercent = tierConfig.sizes[i] ?? (1 / tierConfig.askOffsets.length);
+
+      // Price = bestAsk + offset (behind the best ask)
+      let price = bestAsk + offset * TICK_SIZE;
+      price = roundToTick(clampPrice(price));
+
+      const size = Math.round(totalAskSize * sizePercent * 100) / 100;
+
+      if (size > 0 && price > 0) {
+        quotes.push({
+          tier: i,
+          side: "ASK",
+          price,
+          size,
+        });
+      }
+    }
+  }
+
+  return quotes;
+}
+
+/**
+ * Parse tier config from comma-separated strings (as stored in DB)
+ */
+export function parseTierConfig(
+  bidOffsetsStr: string,
+  askOffsetsStr: string,
+  sizesStr: string
+): TierConfig {
+  return {
+    bidOffsets: bidOffsetsStr.split(",").map((s) => parseInt(s.trim(), 10)),
+    askOffsets: askOffsetsStr.split(",").map((s) => parseInt(s.trim(), 10)),
+    sizes: sizesStr.split(",").map((s) => parseFloat(s.trim())),
+  };
 }
 
 /**

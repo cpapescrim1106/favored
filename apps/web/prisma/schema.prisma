@@ -215,7 +215,7 @@ model MarketMaker {
   orderSize     Decimal @db.Decimal(18, 6) // Shares per side
   maxInventory  Decimal @db.Decimal(18, 6) // Max shares exposure per outcome
   skewFactor    Decimal @db.Decimal(5, 4) // Max price shift at full inventory
-  quotingPolicy String  @default("inside") // "touch", "inside", "back"
+  quotingPolicy String  @default("touch") // "touch", "inside", "back", "defensive"
 
   // Dual-outcome inventory (in shares)
   yesInventory Decimal @default(0) @db.Decimal(18, 6) // YES token position
@@ -244,7 +244,7 @@ model MarketMaker {
   @@map("market_makers")
 }
 
-/// Active orders for a market maker (up to 4 per market: YES bid/ask + NO bid/ask)
+/// Active orders for a market maker (supports tiered quoting with multiple orders per side)
 model MarketMakerOrder {
   id            String      @id @default(cuid())
   marketMakerId String
@@ -252,16 +252,19 @@ model MarketMakerOrder {
 
   outcome String // "YES" or "NO"
   side    String // "BID" or "ASK"
+  tier    Int    @default(0) // Tier level: 0 = closest to mid, 1 = next level, etc.
   orderId String // CLOB order ID
   tokenId String // Token ID for this outcome
   price   Decimal @db.Decimal(10, 6)
   size    Decimal @db.Decimal(18, 6) // Shares
+  lastMatchedSize Decimal? @db.Decimal(18, 6) // Tracks cumulative matched size for partial fills
 
   placedAt  DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([marketMakerId, outcome, side])
+  @@unique([marketMakerId, outcome, side, tier])
   @@index([orderId])
+  @@index([marketMakerId, outcome, side])
   @@map("market_maker_orders")
 }
 
@@ -370,14 +373,20 @@ model Config {
   excludedCategories String[] @default([])
 
   // Market Making defaults (sizes in shares)
-  mmDefaultSpread         Decimal @default(0.02) @db.Decimal(5, 4) // 2%
+  mmDefaultSpread         Decimal @default(0.04) @db.Decimal(5, 4) // 4%
   mmDefaultOrderSize      Decimal @default(100) @db.Decimal(18, 6) // Shares per side
   mmDefaultMaxInventory   Decimal @default(500) @db.Decimal(18, 6) // Max shares per outcome
-  mmDefaultSkewFactor     Decimal @default(0.02) @db.Decimal(5, 4) // Max price shift at full inv
-  mmDefaultQuotingPolicy  String  @default("inside") // "touch", "inside", "back"
+  mmDefaultSkewFactor     Decimal @default(0.04) @db.Decimal(5, 4) // Max price shift at full inv
+  mmDefaultQuotingPolicy  String  @default("touch") // "touch", "inside", "back", "tiered"
   mmRefreshThreshold      Decimal @default(0.01) @db.Decimal(5, 4) // 1% price move triggers refresh
   mmMinTimeToResolution   Int     @default(24) // Hours before end to stop quoting
   mmEnabled               Boolean @default(false) // Global MM kill switch
+
+  // Tiered quoting config (global defaults for "tiered" policy)
+  mmTierCount      Int    @default(2) // Number of price levels per side
+  mmTierBidOffsets String @default("1,2") // Cents behind best bid (comma-separated)
+  mmTierAskOffsets String @default("0,1") // Cents behind best ask (comma-separated)
+  mmTierSizes      String @default("0.5,0.5") // Size % per tier (comma-separated)
 
   updatedAt DateTime @updatedAt
 
