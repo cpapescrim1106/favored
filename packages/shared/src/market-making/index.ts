@@ -16,7 +16,7 @@ export const TICK_SIZE = 0.01;
 export const MIN_PRICE = 0.01;
 export const MAX_PRICE = 0.99;
 
-export type QuotingPolicy = "touch" | "inside" | "back";
+export type QuotingPolicy = "touch" | "inside" | "back" | "defensive";
 
 export interface QuoteParams {
   midPrice: number;
@@ -98,6 +98,21 @@ export function calculateQuotes(params: QuoteParams): Quote {
       bidPrice = Math.min(bidPrice, bestBid);
       askPrice = Math.max(askPrice, bestAsk);
     }
+  } else if (quotingPolicy === "defensive" && bestBid !== undefined && bestAsk !== undefined) {
+    // Defensive policy: simple spread capture
+    // - BUY: back of book (use calculated price, don't chase)
+    // - SELL: touch (join best ask) but only above cost basis
+
+    const avgCost = params.avgCost ?? 0;
+
+    // BUY SIDE: back of book (calculated price already set, just cap at bestBid)
+    bidPrice = Math.min(bidPrice, bestBid);
+
+    // SELL SIDE: touch at best ask, but floor at cost basis
+    askPrice = bestAsk;
+    if (avgCost > 0) {
+      askPrice = Math.max(askPrice, avgCost);
+    }
   }
   // "back" policy: use calculated prices as-is (back of the book)
 
@@ -122,15 +137,10 @@ export function calculateQuotes(params: QuoteParams): Quote {
   if (inventory <= 0) {
     askSize = 0; // No inventory = no selling
   } else {
-    // Aggressive sell sizing when profitable or high exposure
-    const isProfitable = params.avgCost !== undefined && midPrice >= params.avgCost;
-    const isHighExposure = Math.abs(invNorm) >= 0.7;
-
-    if (isProfitable || isHighExposure) {
-      // Sell more aggressively: max of 3x order size or 50% of inventory
-      const aggressiveSize = Math.max(orderSize * 3, inventory * 0.5);
-      askSize = Math.min(inventory, aggressiveSize);
-    }
+    // Always use larger sell size to build queue priority
+    // Rest larger orders to gain time priority for when market comes back
+    const aggressiveSize = Math.max(orderSize * 3, inventory * 0.5);
+    askSize = Math.min(inventory, aggressiveSize);
   }
 
   if (reduceOnly) {
