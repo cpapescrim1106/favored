@@ -23,6 +23,7 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
     "axios": "^1.13.2",
     "https-proxy-agent": "^7.0.6"
   }

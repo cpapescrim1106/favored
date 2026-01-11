@@ -432,31 +432,119 @@ export async function placeOrder(order: OrderRequest): Promise<OrderResponse> {
       orderOptions.expiration = order.expiration;
     }
 
-    // Update allowances before placing order
-    try {
-      if (order.side === "SELL") {
-        // SELL orders need CONDITIONAL token approval
-        console.log(`[CLOB] Updating CONDITIONAL allowance for token ${order.tokenId.slice(0, 12)}...`);
-        await client.updateBalanceAllowance({
-          asset_type: AssetType.CONDITIONAL,
-          token_id: order.tokenId,
+    // Refresh allowance cache and verify before placing order
+    // NOTE: updateBalanceAllowance() refreshes Polymarket's cached view of on-chain allowances,
+    // it does NOT set approvals. Approvals must exist on-chain from the funder (Safe) wallet.
+    const ALLOWANCE_RETRIES = 3;
+    const ALLOWANCE_RETRY_DELAY_MS = 500;
+
+    for (let attempt = 0; attempt < ALLOWANCE_RETRIES; attempt++) {
+      try {
+        if (order.side === "SELL") {
+          // SELL orders need CONDITIONAL token approval from Safe to CTF/Exchange
+          await client.updateBalanceAllowance({
+            asset_type: AssetType.CONDITIONAL,
+            token_id: order.tokenId,
+          });
+        } else {
+          // BUY orders need COLLATERAL (USDC) approval from Safe to Exchange
+          await client.updateBalanceAllowance({
+            asset_type: AssetType.COLLATERAL,
+          });
+        }
+
+        // Brief delay to let cache propagate
+        if (attempt === 0) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+
+        // Verify allowance is sufficient
+        const assetType = order.side === "SELL" ? AssetType.CONDITIONAL : AssetType.COLLATERAL;
+        const balanceCheck = await client.getBalanceAllowance({
+          asset_type: assetType,
+          ...(order.side === "SELL" ? { token_id: order.tokenId } : {}),
         });
-        console.log("[CLOB] CONDITIONAL allowance updated");
-      } else {
-        // BUY orders need COLLATERAL (USDC) approval
-        console.log("[CLOB] Updating COLLATERAL (USDC) allowance...");
-        await client.updateBalanceAllowance({
-          asset_type: AssetType.COLLATERAL,
-        });
-        console.log("[CLOB] COLLATERAL allowance updated");
+
+        // Debug: log raw response for CONDITIONAL tokens
+        console.log(`[CLOB] Balance/Allowance response for ${order.side === "SELL" ? "CONDITIONAL" : "COLLATERAL"}:`, JSON.stringify(balanceCheck, null, 2));
+
+        // Handle response format - for CONDITIONAL tokens, approvals field indicates ERC1155 operator approval
+        // For COLLATERAL, allowances map indicates ERC20 allowances to different contracts
+        const rawResponse = balanceCheck as unknown as {
+          allowance?: string;
+          allowances?: Record<string, string>;
+          approvals?: Record<string, boolean>;
+          balance?: string;
+        };
+
+        let allowance = 0;
+        let isApproved = false;
+
+        // For CONDITIONAL (ERC1155): check approvals map for setApprovalForAll status
+        if (rawResponse?.approvals && typeof rawResponse.approvals === "object") {
+          // Check if any exchange contract has approval
+          isApproved = Object.values(rawResponse.approvals).some((v) => v === true);
+          // For comparison purposes, set allowance to infinity if approved
+          if (isApproved) {
+            allowance = Number.MAX_SAFE_INTEGER;
+          }
+          console.log(`[CLOB] CONDITIONAL approvals:`, rawResponse.approvals, `isApproved: ${isApproved}`);
+        }
+
+        // For COLLATERAL (ERC20): check allowance/allowances
+        if (rawResponse?.allowance) {
+          allowance = parseFloat(rawResponse.allowance);
+        } else if (rawResponse?.allowances && typeof rawResponse.allowances === "object") {
+          const allowanceValues = Object.values(rawResponse.allowances);
+          if (allowanceValues.length > 0) {
+            allowance = Math.min(...allowanceValues.map((v) => parseFloat(v) || 0));
+          }
+        }
+
+        const balance = parseFloat(rawResponse?.balance || "0");
+        const USDC_DECIMALS = 1e6;
+        const requiredAmount = order.side === "BUY"
+          ? (order.price * order.size) * USDC_DECIMALS
+          : order.size * USDC_DECIMALS;
+
+        // For SELL orders with CONDITIONAL tokens, check approval status
+        // For BUY orders with COLLATERAL, check numerical allowance
+        const hasApproval = order.side === "SELL"
+          ? (isApproved || allowance >= requiredAmount)
+          : (allowance >= requiredAmount);
+
+        if (hasApproval && balance >= requiredAmount) {
+          console.log(`[CLOB] Allowance OK: ${order.side === "SELL" ? `approved=${isApproved}` : (allowance / USDC_DECIMALS).toFixed(2)}, balance: ${(balance / USDC_DECIMALS).toFixed(2)}`);
+          break;
+        }
+
+        console.warn(`[CLOB] Allowance check attempt ${attempt + 1}: allowance=${(allowance / USDC_DECIMALS).toFixed(2)}, balance=${(balance / USDC_DECIMALS).toFixed(2)}, required=${(requiredAmount / USDC_DECIMALS).toFixed(2)}`);
+
+        if (attempt < ALLOWANCE_RETRIES - 1) {
+          await new Promise((r) => setTimeout(r, ALLOWANCE_RETRY_DELAY_MS * (attempt + 1)));
+        }
+      } catch (allowanceError) {
+        console.error(`[CLOB] Allowance refresh attempt ${attempt + 1} failed:`, allowanceError);
+        if (attempt < ALLOWANCE_RETRIES - 1) {
+          await new Promise((r) => setTimeout(r, ALLOWANCE_RETRY_DELAY_MS * (attempt + 1)));
+        }
       }
-    } catch (allowanceError) {
-      console.error("[CLOB] Failed to update allowance:", allowanceError);
-      // Continue anyway - allowance might already be set
     }
 
     // Create and sign order
     const signedOrder = await client.createOrder(orderOptions);
+
+    // Log SignedOrder fields for debugging (per Polymarket docs recommendations)
+    // This helps diagnose "not enough balance / allowance" errors
+    console.log("[CLOB] SignedOrder:", {
+      maker: signedOrder.maker,
+      signer: signedOrder.signer,
+      signatureType: signedOrder.signatureType,
+      tokenId: signedOrder.tokenId?.substring(0, 20) + "...",
+      makerAmount: signedOrder.makerAmount,
+      takerAmount: signedOrder.takerAmount,
+      side: signedOrder.side,
+    });
 
     // Post the order with type and postOnly options
     const response = await client.postOrder(signedOrder, orderTypeEnum, order.postOnly);
@@ -778,9 +866,31 @@ export async function getBalance(): Promise<{ balance: number; allowance: number
 
     // USDC has 6 decimals, so divide by 1e6 to get actual USD value
     const USDC_DECIMALS = 1e6;
+
+    // Handle both singular 'allowance' and plural 'allowances' response formats
+    // The API returns allowances as a map of contract address -> allowance amount
+    // TypeScript types only show 'allowance' but runtime response may have 'allowances'
+    const rawResponse = response as unknown as {
+      allowance?: string;
+      allowances?: Record<string, string>;
+      balance?: string;
+    };
+
+    let totalAllowance = 0;
+    if (rawResponse.allowance) {
+      totalAllowance = parseFloat(rawResponse.allowance);
+    } else if (rawResponse.allowances && typeof rawResponse.allowances === "object") {
+      // Sum up all allowances (or take the minimum for safety)
+      const allowanceValues = Object.values(rawResponse.allowances);
+      if (allowanceValues.length > 0) {
+        // Use minimum allowance as the effective allowance
+        totalAllowance = Math.min(...allowanceValues.map((v) => parseFloat(v) || 0));
+      }
+    }
+
     return {
-      balance: parseFloat(response.balance || "0") / USDC_DECIMALS,
-      allowance: parseFloat(response.allowance || "0") / USDC_DECIMALS,
+      balance: parseFloat(rawResponse.balance || "0") / USDC_DECIMALS,
+      allowance: totalAllowance / USDC_DECIMALS,
     };
   } catch (error) {
     // Silently fail - balance will show as "—"

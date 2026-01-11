@@ -582,23 +582,35 @@ async function processMarketMaker(
     return;
   }
 
-  // COMPUTE RESERVED AMOUNTS from existing open orders
-  // Used for pre-order balance and position checks
-  const existingOrders = mm.orders || [];
+  // COMPUTE RESERVED AMOUNTS from CLOB open orders (source of truth)
+  // Filter cycleContext.openOrders by this market's token IDs
+  // This correctly accounts for orders that may not be in our DB
+  const marketClobOrders = cycleContext.openOrders.filter(
+    (o) => o.asset_id === yesTokenId || o.asset_id === noTokenId
+  );
 
-  // Reserved buy exposure = sum of (price * size) for all outstanding BID orders
-  const reservedBuyExposure = existingOrders
-    .filter((o) => o.side === "BID")
+  // Reserved buy exposure = sum of (price * size) for all outstanding BUY orders
+  // CLOB uses BUY/SELL, not BID/ASK
+  const reservedBuyExposure = marketClobOrders
+    .filter((o) => o.side === "BUY")
     .reduce((sum, o) => sum + Number(o.price) * Number(o.size), 0);
 
-  // Reserved sell inventory per outcome = sum of size for all outstanding ASK orders
-  const reservedSellYes = existingOrders
-    .filter((o) => o.side === "ASK" && o.outcome === "YES")
+  // Reserved sell inventory per outcome = sum of size for all outstanding SELL orders
+  const reservedSellYes = marketClobOrders
+    .filter((o) => o.side === "SELL" && o.asset_id === yesTokenId)
     .reduce((sum, o) => sum + Number(o.size), 0);
 
-  const reservedSellNo = existingOrders
-    .filter((o) => o.side === "ASK" && o.outcome === "NO")
+  const reservedSellNo = marketClobOrders
+    .filter((o) => o.side === "SELL" && o.asset_id === noTokenId)
     .reduce((sum, o) => sum + Number(o.size), 0);
+
+  // Also keep DB orders reference for comparison and fill tracking
+  const existingOrders = mm.orders || [];
+
+  // Log reserved amounts for debugging
+  if (reservedSellYes > 0 || reservedSellNo > 0 || reservedBuyExposure > 0) {
+    console.log(`[MarketMaking] ${mm.market.slug} reserved: BUY=$${reservedBuyExposure.toFixed(2)}, SELL YES=${reservedSellYes.toFixed(2)}, NO=${reservedSellNo.toFixed(2)} (${marketClobOrders.length} CLOB orders, ${existingOrders.length} DB orders)`);
+  }
 
   // Fetch midpoint, spread, and best bid/ask from CLOB (YES + NO)
   const [
@@ -796,8 +808,8 @@ async function processMarketMaker(
     ? Date.now() - mm.lastQuoteAt.getTime()
     : Infinity;
 
-  // existingOrders already computed earlier for reserved amounts
-  const hasAllOrders = existingOrders.length >= 4; // YES bid/ask + NO bid/ask
+  // Use CLOB orders (source of truth) to check if we have all orders
+  const hasAllOrders = marketClobOrders.length >= 4; // YES bid/ask + NO bid/ask
 
   const previousMidPrice = mm.market.yesPrice ? Number(mm.market.yesPrice) : 0.5;
   const needsRefresh =
