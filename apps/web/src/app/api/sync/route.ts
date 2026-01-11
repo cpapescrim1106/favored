@@ -1,0 +1,564 @@
+/**
+ * Data Integrity Sync API
+ *
+ * Provides endpoints for:
+ * - GET: Quick sync status check
+ * - POST: Trigger full sync with auto-correction
+ * - DELETE: Reset to chain state (nuclear option)
+ */
+
+import { prisma } from "@/lib/db";
+import { NextRequest, NextResponse } from "next/server";
+import {
+  fetchActiveOrders,
+  getOrder,
+  getPositions,
+  configureCLOB,
+} from "@favored/shared";
+
+interface SyncIssue {
+  type: string;
+  severity: "INFO" | "WARN" | "ERROR" | "CRITICAL";
+  marketSlug?: string;
+  details: Record<string, unknown>;
+  action: "CORRECTED" | "LOGGED";
+}
+
+interface SyncResult {
+  success: boolean;
+  timestamp: string;
+  duration: number;
+
+  // Order sync
+  ordersInClob: number;
+  ordersInDb: number;
+  ordersRemoved: number;
+  ordersMismatched: number;
+
+  // Position sync
+  positionsInChain: number;
+  marketMakersInDb: number;
+  positionsCorrected: number;
+
+  // Issues
+  issues: SyncIssue[];
+}
+
+/**
+ * GET /api/sync - Quick status check
+ */
+export async function GET() {
+  try {
+    // Get counts from DB
+    const [dbOrders, marketMakers] = await Promise.all([
+      prisma.marketMakerOrder.count(),
+      prisma.marketMaker.findMany({
+        include: { market: { select: { slug: true, clobTokenIds: true } } },
+      }),
+    ]);
+
+    // Build set of tracked token IDs (only count positions for MM-tracked tokens)
+    const trackedTokenIds = new Set<string>();
+    for (const mm of marketMakers) {
+      const tokens = mm.market?.clobTokenIds || [];
+      tokens.forEach((t) => trackedTokenIds.add(t));
+    }
+
+    // Get CLOB orders (with error handling)
+    let clobOrders: Awaited<ReturnType<typeof fetchActiveOrders>> = [];
+    let clobError: string | null = null;
+
+    try {
+      configureCLOB({ dryRun: false });
+      clobOrders = await fetchActiveOrders();
+    } catch (e) {
+      clobError = e instanceof Error ? e.message : String(e);
+    }
+
+    // Get chain positions (with error handling)
+    let chainPositions: Awaited<ReturnType<typeof getPositions>> = [];
+    let chainError: string | null = null;
+
+    try {
+      chainPositions = await getPositions(undefined, {
+        sizeThreshold: 0,
+        limit: 500,
+      });
+    } catch (e) {
+      chainError = e instanceof Error ? e.message : String(e);
+    }
+
+    // Calculate totals - only for MM-tracked tokens
+    const chainTotal = chainPositions
+      .filter((p) => trackedTokenIds.has(p.asset))
+      .reduce((sum, p) => sum + p.size, 0);
+    const dbTotal = marketMakers.reduce(
+      (sum, mm) => sum + Number(mm.yesInventory) + Number(mm.noInventory),
+      0
+    );
+
+    // Check for drift
+    const ordersMatch = clobOrders.length === dbOrders;
+    const positionsMatch = Math.abs(chainTotal - dbTotal) < 1;
+
+    return NextResponse.json({
+      status: ordersMatch && positionsMatch ? "SYNCED" : "DRIFT_DETECTED",
+      orders: {
+        clob: clobOrders.length,
+        db: dbOrders,
+        match: ordersMatch,
+        error: clobError,
+      },
+      positions: {
+        chain: chainPositions.length,
+        chainTotal: chainTotal.toFixed(2),
+        db: marketMakers.length,
+        dbTotal: dbTotal.toFixed(2),
+        drift: (chainTotal - dbTotal).toFixed(2),
+        match: positionsMatch,
+        error: chainError,
+      },
+      lastSync: await getLastSyncTime(),
+    });
+  } catch (error) {
+    console.error("Sync status check failed:", error);
+    return NextResponse.json(
+      { error: "Failed to check sync status" },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * POST /api/sync - Trigger full sync with auto-correction
+ */
+export async function POST(request: NextRequest) {
+  const startTime = Date.now();
+  const issues: SyncIssue[] = [];
+
+  try {
+    const body = await request.json().catch(() => ({}));
+    const autoCorrect = body.autoCorrect !== false; // Default true
+    const verbose = body.verbose === true;
+
+    const result: SyncResult = {
+      success: false,
+      timestamp: new Date().toISOString(),
+      duration: 0,
+      ordersInClob: 0,
+      ordersInDb: 0,
+      ordersRemoved: 0,
+      ordersMismatched: 0,
+      positionsInChain: 0,
+      marketMakersInDb: 0,
+      positionsCorrected: 0,
+      issues: [],
+    };
+
+    configureCLOB({ dryRun: false });
+
+    // Step 1: Sync orders
+    await syncOrders(result, issues, autoCorrect, verbose);
+
+    // Step 2: Sync positions
+    await syncPositions(result, issues, autoCorrect, verbose);
+
+    result.success = true;
+    result.duration = Date.now() - startTime;
+    result.issues = issues;
+
+    // Log to database
+    await prisma.log.create({
+      data: {
+        level: issues.some((i) => i.severity === "ERROR" || i.severity === "CRITICAL")
+          ? "WARN"
+          : "INFO",
+        category: "RECONCILE",
+        message: `Full sync completed: ${issues.length} issues, ${result.positionsCorrected} positions corrected`,
+        metadata: {
+          duration: result.duration,
+          ordersRemoved: result.ordersRemoved,
+          positionsCorrected: result.positionsCorrected,
+          issueCount: issues.length,
+        },
+      },
+    });
+
+    return NextResponse.json(result);
+  } catch (error) {
+    console.error("Full sync failed:", error);
+    return NextResponse.json(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        duration: Date.now() - startTime,
+        issues,
+      },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * DELETE /api/sync - Reset to chain state (nuclear option)
+ * Requires confirmation in body
+ */
+export async function DELETE(request: NextRequest) {
+  try {
+    const body = await request.json().catch(() => ({}));
+
+    if (body.confirm !== "RESET_TO_CHAIN") {
+      return NextResponse.json(
+        {
+          error: 'Confirmation required. Send {"confirm": "RESET_TO_CHAIN"} to proceed.',
+        },
+        { status: 400 }
+      );
+    }
+
+    configureCLOB({ dryRun: false });
+
+    // Get chain positions
+    const chainPositions = await getPositions(undefined, {
+      sizeThreshold: 0,
+      limit: 500,
+    });
+
+    const positionMap = new Map(
+      chainPositions.map((p) => [
+        p.asset,
+        { size: p.size, avgPrice: p.avgPrice },
+      ])
+    );
+
+    // Get all MMs
+    const marketMakers = await prisma.marketMaker.findMany({
+      include: { market: { select: { clobTokenIds: true, slug: true } } },
+    });
+
+    let marketsReset = 0;
+
+    for (const mm of marketMakers) {
+      const yesTokenId = mm.market?.clobTokenIds?.[0];
+      const noTokenId = mm.market?.clobTokenIds?.[1];
+
+      const yesPos = yesTokenId ? positionMap.get(yesTokenId) : null;
+      const noPos = noTokenId ? positionMap.get(noTokenId) : null;
+
+      await prisma.marketMaker.update({
+        where: { id: mm.id },
+        data: {
+          yesInventory: yesPos?.size ?? 0,
+          noInventory: noPos?.size ?? 0,
+          avgYesCost: yesPos?.avgPrice ?? 0,
+          avgNoCost: noPos?.avgPrice ?? 0,
+        },
+      });
+
+      marketsReset++;
+    }
+
+    // Clear all order tracking
+    const { count: ordersCleared } = await prisma.marketMakerOrder.deleteMany();
+
+    // Log the reset
+    await prisma.log.create({
+      data: {
+        level: "WARN",
+        category: "RECONCILE",
+        message: `RESET TO CHAIN: ${marketsReset} markets reset, ${ordersCleared} orders cleared`,
+        metadata: { marketsReset, ordersCleared },
+      },
+    });
+
+    return NextResponse.json({
+      success: true,
+      marketsReset,
+      ordersCleared,
+      message: "All MM inventory reset to match on-chain positions",
+    });
+  } catch (error) {
+    console.error("Reset to chain failed:", error);
+    return NextResponse.json(
+      { error: "Failed to reset to chain" },
+      { status: 500 }
+    );
+  }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+async function getLastSyncTime(): Promise<string | null> {
+  const lastLog = await prisma.log.findFirst({
+    where: {
+      category: "RECONCILE",
+      message: { contains: "Full sync completed" },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  return lastLog?.createdAt.toISOString() ?? null;
+}
+
+async function syncOrders(
+  result: SyncResult,
+  issues: SyncIssue[],
+  autoCorrect: boolean,
+  verbose: boolean
+): Promise<void> {
+  // Fetch CLOB orders
+  const clobOrders = await fetchActiveOrders();
+  result.ordersInClob = clobOrders.length;
+
+  // Fetch DB orders
+  const dbOrders = await prisma.marketMakerOrder.findMany({
+    include: {
+      marketMaker: {
+        include: { market: { select: { slug: true } } },
+      },
+    },
+  });
+  result.ordersInDb = dbOrders.length;
+
+  const clobOrderIds = new Set(clobOrders.map((o) => o.id));
+
+  // Check for DB orders not in CLOB
+  for (const dbOrder of dbOrders) {
+    if (!clobOrderIds.has(dbOrder.orderId)) {
+      // Verify with getOrder
+      const orderStatus = await getOrder(dbOrder.orderId);
+
+      if (
+        orderStatus.status === "not_found" ||
+        (orderStatus.status === "ok" &&
+          ["MATCHED", "CANCELLED", "EXPIRED"].includes(
+            orderStatus.order?.status?.toUpperCase() || ""
+          ))
+      ) {
+        issues.push({
+          type: "ORDER_IN_DB_NOT_CLOB",
+          severity: "WARN",
+          marketSlug: dbOrder.marketMaker?.market?.slug,
+          details: {
+            orderId: dbOrder.orderId,
+            status: orderStatus.status,
+          },
+          action: autoCorrect ? "CORRECTED" : "LOGGED",
+        });
+
+        if (autoCorrect) {
+          // Check for unrecorded fills before deleting
+          if (orderStatus.status === "ok" && orderStatus.order) {
+            const sizeMatched = Number(orderStatus.order.size_matched || 0);
+            const lastMatched = dbOrder.lastMatchedSize
+              ? Number(dbOrder.lastMatchedSize)
+              : 0;
+
+            if (sizeMatched > lastMatched) {
+              await recordFill(
+                dbOrder.marketMaker.id,
+                dbOrder,
+                sizeMatched - lastMatched
+              );
+            }
+          }
+
+          await prisma.marketMakerOrder.delete({ where: { id: dbOrder.id } });
+          result.ordersRemoved++;
+        }
+      }
+    }
+  }
+}
+
+async function syncPositions(
+  result: SyncResult,
+  issues: SyncIssue[],
+  _autoCorrect: boolean, // Unused - positions are always alert-only
+  _verbose: boolean
+): Promise<void> {
+  // Get all MMs FIRST to calculate tracked inventory
+  const marketMakers = await prisma.marketMaker.findMany({
+    include: { market: { select: { slug: true, clobTokenIds: true } } },
+  });
+  result.marketMakersInDb = marketMakers.length;
+
+  // Calculate total tracked inventory BEFORE fetching chain positions
+  const totalTrackedInventory = marketMakers.reduce(
+    (sum, mm) => sum + Number(mm.yesInventory) + Number(mm.noInventory),
+    0
+  );
+
+  // Fetch chain positions
+  const chainPositions = await getPositions(undefined, {
+    sizeThreshold: 0,
+    limit: 500,
+  });
+  result.positionsInChain = chainPositions.length;
+
+  // EMPTY RESPONSE GUARD: Protect against zeroing inventory on empty API response
+  if (chainPositions.length === 0 && totalTrackedInventory > 1.0) {
+    console.error(
+      "[Sync API] EMPTY RESPONSE GUARD: Data API returned empty but DB has inventory"
+    );
+    issues.push({
+      type: "POSITION_DRIFT",
+      severity: "CRITICAL",
+      details: {
+        guard: "empty_response_protection",
+        trackedInventory: totalTrackedInventory,
+        action: "sync_skipped",
+      },
+      action: "LOGGED",
+    });
+    return; // DO NOT PROCEED - prevent zeroing inventory
+  }
+
+  const positionMap = new Map(
+    chainPositions.map((p) => [
+      p.asset,
+      { size: p.size, avgPrice: p.avgPrice },
+    ])
+  );
+
+  // ALERT-ONLY MODE: Without a dedicated MM wallet, we can't distinguish
+  // MM positions from manual trades. Log drift for review, never auto-correct.
+  for (const mm of marketMakers) {
+    const yesTokenId = mm.market?.clobTokenIds?.[0];
+    const noTokenId = mm.market?.clobTokenIds?.[1];
+
+    // Check YES
+    if (yesTokenId) {
+      const chainPos = positionMap.get(yesTokenId);
+      const dbInventory = Number(mm.yesInventory);
+      const chainSize = chainPos?.size ?? 0;
+      const drift = Math.abs(dbInventory - chainSize);
+
+      if (drift > 0.1) {
+        issues.push({
+          type: "POSITION_DRIFT",
+          severity: drift > 10 ? "ERROR" : "WARN",
+          marketSlug: mm.market?.slug,
+          details: {
+            outcome: "YES",
+            dbInventory,
+            chainSize,
+            drift,
+            note: "Manual review required - no auto-correction without dedicated wallet",
+          },
+          action: "LOGGED", // NEVER auto-correct positions
+        });
+        // DO NOT UPDATE DB - alert only
+      }
+    }
+
+    // Check NO
+    if (noTokenId) {
+      const chainPos = positionMap.get(noTokenId);
+      const dbInventory = Number(mm.noInventory);
+      const chainSize = chainPos?.size ?? 0;
+      const drift = Math.abs(dbInventory - chainSize);
+
+      if (drift > 0.1) {
+        issues.push({
+          type: "POSITION_DRIFT",
+          severity: drift > 10 ? "ERROR" : "WARN",
+          marketSlug: mm.market?.slug,
+          details: {
+            outcome: "NO",
+            dbInventory,
+            chainSize,
+            drift,
+            note: "Manual review required - no auto-correction without dedicated wallet",
+          },
+          action: "LOGGED", // NEVER auto-correct positions
+        });
+        // DO NOT UPDATE DB - alert only
+      }
+    }
+  }
+}
+
+async function recordFill(
+  marketMakerId: string,
+  order: {
+    orderId: string;
+    outcome: string;
+    side: string;
+    price: unknown;
+  },
+  fillSize: number
+): Promise<void> {
+  const isBuy = order.side === "BID";
+  const isYes = order.outcome === "YES";
+  const price = Number(order.price);
+  const value = price * fillSize;
+
+  // Get current MM state
+  const mm = await prisma.marketMaker.findUnique({
+    where: { id: marketMakerId },
+  });
+  if (!mm) return;
+
+  let yesInventory = Number(mm.yesInventory);
+  let noInventory = Number(mm.noInventory);
+  let avgYesCost = Number(mm.avgYesCost);
+  let avgNoCost = Number(mm.avgNoCost);
+  let realizedPnl = Number(mm.realizedPnl);
+  let fillRealizedPnl: number | null = null;
+
+  if (isYes) {
+    if (isBuy) {
+      const totalCost = avgYesCost * yesInventory + value;
+      yesInventory += fillSize;
+      avgYesCost = yesInventory > 0 ? totalCost / yesInventory : 0;
+    } else {
+      if (yesInventory > 0) {
+        fillRealizedPnl = (price - avgYesCost) * fillSize;
+        realizedPnl += fillRealizedPnl;
+      }
+      yesInventory = Math.max(0, yesInventory - fillSize);
+      if (yesInventory <= 0) avgYesCost = 0;
+    }
+  } else {
+    if (isBuy) {
+      const totalCost = avgNoCost * noInventory + value;
+      noInventory += fillSize;
+      avgNoCost = noInventory > 0 ? totalCost / noInventory : 0;
+    } else {
+      if (noInventory > 0) {
+        fillRealizedPnl = (price - avgNoCost) * fillSize;
+        realizedPnl += fillRealizedPnl;
+      }
+      noInventory = Math.max(0, noInventory - fillSize);
+      if (noInventory <= 0) avgNoCost = 0;
+    }
+  }
+
+  // Record the fill
+  await prisma.marketMakerFill.create({
+    data: {
+      marketMakerId,
+      outcome: order.outcome,
+      side: isBuy ? "BUY" : "SELL",
+      orderId: order.orderId,
+      price,
+      size: fillSize,
+      value,
+      realizedPnl: fillRealizedPnl,
+    },
+  });
+
+  // Update MM state
+  await prisma.marketMaker.update({
+    where: { id: marketMakerId },
+    data: {
+      yesInventory,
+      noInventory,
+      avgYesCost,
+      avgNoCost,
+      realizedPnl,
+    },
+  });
+}

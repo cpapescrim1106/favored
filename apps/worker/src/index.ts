@@ -2,25 +2,96 @@ import cron from "node-cron";
 import { runScanJob } from "./jobs/scan.js";
 import { runReconcileJob } from "./jobs/reconcile.js";
 import { runExitCheckJob } from "./jobs/exit-check.js";
+import { runMarketMakingJob } from "./jobs/market-making.js";
+import { fullSync, quickSync } from "./jobs/data-integrity.js";
 import { prisma } from "./lib/db.js";
 
 const SCAN_INTERVAL = process.env.SCAN_INTERVAL || "*/10 * * * *"; // Every 10 minutes
+const MM_INTERVAL = process.env.MM_INTERVAL || "*/30 * * * * *"; // Every 30 seconds
+const SYNC_INTERVAL = process.env.SYNC_INTERVAL || "0 * * * *"; // Every hour (sync is now alert-only)
 
 async function main() {
   console.log("[Worker] Starting Favored worker service...");
   console.log(`[Worker] Scan interval: ${SCAN_INTERVAL}`);
+  console.log(`[Worker] Market Making interval: ${MM_INTERVAL}`);
+  console.log(`[Worker] Data Sync interval: ${SYNC_INTERVAL}`);
+
+  // Run initial data integrity sync on startup (corrects any drift)
+  console.log("[Worker] Running initial data integrity sync...");
+  try {
+    const syncResult = await fullSync(true, true);
+    console.log(`[Worker] Initial sync: ${syncResult.issues.length} issues found, ${syncResult.positionsCorrected} positions corrected`);
+  } catch (e) {
+    console.error("[Worker] Initial sync failed:", e);
+  }
 
   // Run initial scan on startup
   console.log("[Worker] Running initial scan...");
   await runAllJobs();
 
-  // Schedule recurring jobs
+  // Schedule recurring scanner jobs (every 10 minutes)
   cron.schedule(SCAN_INTERVAL, async () => {
-    console.log(`[Worker] Cron triggered at ${new Date().toISOString()}`);
+    console.log(`[Worker] Scan cron triggered at ${new Date().toISOString()}`);
     await runAllJobs();
   });
 
+  // Schedule market making job (every 30 seconds)
+  cron.schedule(MM_INTERVAL, async () => {
+    await runMarketMakingJobWrapper();
+  });
+
+  // Schedule data integrity sync (every 5 minutes)
+  cron.schedule(SYNC_INTERVAL, async () => {
+    await runDataIntegritySyncWrapper();
+  });
+
   console.log("[Worker] Worker service started. Waiting for scheduled jobs...");
+}
+
+// Wrapper to prevent overlapping MM jobs
+let mmJobRunning = false;
+async function runMarketMakingJobWrapper() {
+  if (mmJobRunning) {
+    return; // Skip if previous job is still running
+  }
+
+  mmJobRunning = true;
+  try {
+    // Run MM job (includes fill checking)
+    await runMarketMakingJob();
+  } catch (error) {
+    console.error("[Worker] Market making job error:", error);
+  } finally {
+    mmJobRunning = false;
+  }
+}
+
+// Wrapper to prevent overlapping sync jobs
+let syncJobRunning = false;
+async function runDataIntegritySyncWrapper() {
+  if (syncJobRunning) {
+    return; // Skip if previous sync is still running
+  }
+
+  syncJobRunning = true;
+  try {
+    // First do a quick check
+    const quickResult = await quickSync();
+
+    if (!quickResult.ordersMatch || !quickResult.positionsMatch) {
+      // Drift detected - run full sync with auto-correction
+      console.log("[Worker] Drift detected, running full sync...");
+      const syncResult = await fullSync(true, false);
+
+      if (syncResult.issues.length > 0) {
+        console.log(`[Worker] Sync corrected ${syncResult.positionsCorrected} positions, removed ${syncResult.ordersRemoved} stale orders`);
+      }
+    }
+  } catch (error) {
+    console.error("[Worker] Data integrity sync error:", error);
+  } finally {
+    syncJobRunning = false;
+  }
 }
 
 async function runAllJobs() {
