@@ -53,3 +53,7 @@ certs/
 
 # playwright artifacts
 .playwright-mcp/
+maximus.taila6f62d.ts.net.crt
+maximus.taila6f62d.ts.net.key
+*.crt
+*.key

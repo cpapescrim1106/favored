@@ -5,5 +5,5 @@
 
 :3443 {
 	tls /certs/maximus.taila6f62d.ts.net.crt /certs/maximus.taila6f62d.ts.net.key
-	reverse_proxy web:3000
+	reverse_proxy localhost:3000
 }

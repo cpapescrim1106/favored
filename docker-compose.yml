@@ -2,22 +2,51 @@
 # Usage: docker-compose up -d --build
 
 services:
-  # Caddy Reverse Proxy (HTTPS)
+  # Surfshark VPN via Gluetun
+  vpn:
+    image: qmcgaw/gluetun
+    container_name: favored-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_SERVICE_PROVIDER=surfshark
+      - VPN_TYPE=openvpn
+      - OPENVPN_USER=${SURFSHARK_USER}
+      - OPENVPN_PASSWORD=${SURFSHARK_PASS}
+      - SERVER_COUNTRIES=Netherlands
+    ports:
+      # Web app port (exposed through VPN)
+      - "${WEB_PORT:-3009}:3000"
+      # Caddy HTTPS port
+      - "3443:3443"
+    volumes:
+      - gluetun_data:/gluetun
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "https://polymarket.com/api/geoblock"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Caddy Reverse Proxy (HTTPS) - connects to VPN network
   caddy:
     image: caddy:2-alpine
     container_name: favored-caddy
     restart: unless-stopped
-    ports:
-      - "3443:3443"
+    network_mode: "service:vpn"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./certs:/certs:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - web
+      vpn:
+        condition: service_healthy
 
-  # PostgreSQL Database
+  # PostgreSQL Database (no VPN needed - local only)
   db:
     image: postgres:17-alpine
     container_name: favored-db
@@ -36,15 +65,14 @@ services:
       timeout: 5s
       retries: 5
 
-  # Next.js Web App
+  # Next.js Web App - routes through VPN
   web:
     build:
       context: .
       dockerfile: apps/web/Dockerfile.dev
     container_name: favored-web
     restart: unless-stopped
-    ports:
-      - "${WEB_PORT:-3009}:3000"
+    network_mode: "service:vpn"
     volumes:
       - ./apps/web:/app/apps/web
       - ./packages/shared:/app/packages/shared
@@ -59,15 +87,18 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      vpn:
+        condition: service_healthy
     command: sh -c "npm run db:push --workspace=@favored/web && npm run dev --workspace=@favored/web"
 
-  # Worker Service
+  # Worker Service - routes through VPN
   worker:
     build:
       context: .
       dockerfile: apps/worker/Dockerfile.dev
     container_name: favored-worker
     restart: unless-stopped
+    network_mode: "service:vpn"
     volumes:
       - ./apps/worker:/app/apps/worker
       - ./packages/shared:/app/packages/shared
@@ -82,11 +113,13 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      vpn:
+        condition: service_healthy
       web:
         condition: service_started
     command: npm run dev --workspace=@favored/worker
 
-  # Prisma Studio (optional, for database management)
+  # Prisma Studio (optional, for database management) - no VPN needed
   prisma-studio:
     build:
       context: .
@@ -111,3 +144,4 @@ volumes:
   postgres_data:
   caddy_data:
   caddy_config:
+  gluetun_data:
