@@ -32,6 +32,11 @@ favored/
    cp .env.example .env
    ```
 
+2. Configure Polymarket CLOB credentials (required for real trading):
+   - `WALLET_PRIVATE_KEY` = your signer EOA private key (MetaMask/private key)
+   - `POLYMARKET_FUNDER_ADDRESS` = your Polymarket profile/proxy wallet (Safe) address
+   - Generate API creds with: `npx tsx scripts/generate-api-creds.ts`
+
 2. Start services:
    ```bash
    docker-compose up -d

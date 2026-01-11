@@ -117,12 +117,11 @@ export function scoreCandidate(
   const liqScore = Math.min(25, 25 * (Math.log10(liqRatio + 1) / 2));
 
   // 4. Time to resolution score
-  // Sweet spot is 7-30 days
-  // Too short (< 7 days) = risky, might resolve before fill
+  // Sweet spot is 1-30 days (including same-day for live sports)
   // Too long (> 90 days) = capital tied up
   let timeScore: number;
-  if (input.daysToClose >= 7 && input.daysToClose <= 30) {
-    // Perfect range
+  if (input.daysToClose >= 1 && input.daysToClose <= 30) {
+    // Good range - full points (includes live sports)
     timeScore = 25;
   } else if (input.daysToClose > 30 && input.daysToClose <= 60) {
     // Acceptable range
@@ -133,14 +132,11 @@ export function scoreCandidate(
   } else if (input.daysToClose > 90) {
     // Too long
     timeScore = Math.max(0, 5 - (input.daysToClose - 90) / 30);
-  } else if (input.daysToClose >= 3 && input.daysToClose < 7) {
-    // Short but ok
-    timeScore = 15 + ((input.daysToClose - 3) / 4) * 10;
-  } else if (input.daysToClose >= 1 && input.daysToClose < 3) {
-    // Very short - risky
-    timeScore = 5 + ((input.daysToClose - 1) / 2) * 10;
+  } else if (input.daysToClose > 0 && input.daysToClose < 1) {
+    // Same day - live sports, still good
+    timeScore = 20;
   } else {
-    // Less than 1 day - probably shouldn't trade
+    // Already resolved or invalid
     timeScore = 0;
   }
 
