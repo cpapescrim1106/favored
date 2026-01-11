@@ -527,7 +527,7 @@ export async function placeBatchOrders(
  * Get order details by ID
  * Returns the order with its current status and fill information
  */
-export async function getOrder(orderId: string): Promise<{
+export type OrderDetails = {
   id: string;
   status: string;
   size_matched: string;
@@ -536,26 +536,39 @@ export async function getOrder(orderId: string): Promise<{
   side: string;
   outcome: string;
   asset_id: string;
-} | null> {
+};
+
+export type OrderResult =
+  | { status: "ok"; order: OrderDetails }
+  | { status: "not_found" }
+  | { status: "error"; message: string };
+
+export async function getOrder(orderId: string): Promise<OrderResult> {
   try {
     const { client } = await initializeClobClient();
     const order = await client.getOrder(orderId);
-    if (!order) return null;
+    if (!order) return { status: "not_found" };
 
     return {
-      id: order.id,
-      status: order.status || "unknown",
-      size_matched: order.size_matched || "0",
-      original_size: order.original_size || "0",
-      price: order.price || "0",
-      side: order.side || "",
-      outcome: order.outcome || "",
-      asset_id: order.asset_id || "",
+      status: "ok",
+      order: {
+        id: order.id,
+        status: order.status || "unknown",
+        size_matched: order.size_matched || "0",
+        original_size: order.original_size || "0",
+        price: order.price || "0",
+        side: order.side || "",
+        outcome: order.outcome || "",
+        asset_id: order.asset_id || "",
+      },
     };
   } catch (error) {
-    // Order not found or error - likely cancelled/expired
+    const message = error instanceof Error ? error.message : String(error);
+    if (/not found|404/i.test(message)) {
+      return { status: "not_found" };
+    }
     console.error(`[CLOB] Failed to get order ${orderId}:`, error);
-    return null;
+    return { status: "error", message };
   }
 }
 
