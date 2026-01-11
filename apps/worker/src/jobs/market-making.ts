@@ -44,6 +44,13 @@ import { addHours, isBefore } from "date-fns";
 // Minimum time between quote refreshes (ms)
 const MIN_QUOTE_INTERVAL = 5000;
 
+// Helper function for delays
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Order verification settings
+const ORDER_VERIFICATION_RETRIES = 3;
+const ORDER_VERIFICATION_BACKOFF_MS = 200;
+
 // ============================================================================
 // SANITY CHECK THRESHOLDS
 // These guard against placing orders at bad prices due to API issues, stale
@@ -198,6 +205,54 @@ async function checkAllFills(
         "[MarketMaking] Open orders returned empty while tracked orders exist; skipping fill reconciliation"
       );
       return;
+    }
+
+    // RECONCILE UNVERIFIED ORDERS
+    // Orders that failed verification on placement need to be checked
+    const unverifiedOrders = await prisma.marketMakerOrder.findMany({
+      where: { verified: false },
+      include: {
+        marketMaker: {
+          include: { market: { select: { slug: true } } },
+        },
+      },
+    });
+
+    for (const order of unverifiedOrders) {
+      const verification = await getOrder(order.orderId);
+
+      if (verification.status === "ok" && verification.order) {
+        // Order exists - update with verified values
+        await prisma.marketMakerOrder.update({
+          where: { id: order.id },
+          data: {
+            price: Number(verification.order.price),
+            size: Number(verification.order.original_size),
+            lastMatchedSize: Number(verification.order.size_matched || 0),
+            verified: true,
+          },
+        });
+        console.log(
+          `[MarketMaking] Verified order ${order.orderId} for ${order.marketMaker?.market?.slug}`
+        );
+        await logQuoteAction(order.marketMakerId, "ORDER_VERIFIED", {
+          orderId: order.orderId,
+          outcome: order.outcome,
+          side: order.side,
+        });
+      } else if (verification.status === "not_found") {
+        // Order never made it to CLOB - delete
+        await prisma.marketMakerOrder.delete({ where: { id: order.id } });
+        console.warn(
+          `[MarketMaking] Unverified order ${order.orderId} not found in CLOB - removing`
+        );
+        await logQuoteAction(order.marketMakerId, "ORDER_NEVER_PLACED", {
+          orderId: order.orderId,
+          outcome: order.outcome,
+          side: order.side,
+        });
+      }
+      // If error, keep for next cycle
     }
 
     // Check each market maker's orders
@@ -1022,6 +1077,56 @@ async function processMarketMaker(
     });
 
     if (orderResult.success && orderResult.orderId) {
+      // ORDER PLACEMENT VERIFICATION GATE
+      // Verify order exists in CLOB before trusting it
+      let verified = false;
+      let verificationResult: Awaited<ReturnType<typeof getOrder>> | null = null;
+
+      for (let attempt = 0; attempt < ORDER_VERIFICATION_RETRIES; attempt++) {
+        if (attempt > 0) {
+          await sleep(ORDER_VERIFICATION_BACKOFF_MS * attempt);
+        }
+        verificationResult = await getOrder(orderResult.orderId);
+        if (verificationResult.status === "ok") {
+          verified = true;
+          break;
+        }
+      }
+
+      if (!verified) {
+        // Verification failed - track as unverified for later reconciliation
+        await logQuoteAction(mm.id, "VERIFICATION_PENDING", {
+          gate: "order_placement",
+          orderId: orderResult.orderId,
+          outcome,
+          side,
+          tier,
+          price: desired.price,
+          size: desired.size,
+          attempts: ORDER_VERIFICATION_RETRIES,
+        });
+
+        // Still write to DB but mark as unverified
+        await prisma.marketMakerOrder.create({
+          data: {
+            marketMakerId: mm.id,
+            outcome,
+            side,
+            tier,
+            orderId: orderResult.orderId,
+            tokenId: desired.tokenId,
+            price: desired.price,
+            size: desired.size,
+            lastMatchedSize: 0,
+            verified: false, // Will be reconciled on next cycle
+          },
+        });
+        result.quotesPlaced++;
+        continue;
+      }
+
+      // Verified - use values from CLOB verification
+      const verifiedOrder = verificationResult!.order!;
       await prisma.marketMakerOrder.create({
         data: {
           marketMakerId: mm.id,
@@ -1030,10 +1135,10 @@ async function processMarketMaker(
           tier,
           orderId: orderResult.orderId,
           tokenId: desired.tokenId,
-          price: desired.price,
-          size: desired.size,
-          // Don't set lastMatchedSize - leave as null for baseline detection
-          // The fill detection logic will set the baseline on first getOrder() call
+          price: Number(verifiedOrder.price),
+          size: Number(verifiedOrder.original_size),
+          lastMatchedSize: Number(verifiedOrder.size_matched || 0),
+          verified: true,
         },
       });
       result.quotesPlaced++;
@@ -1041,9 +1146,10 @@ async function processMarketMaker(
         outcome,
         side,
         tier,
-        price: desired.price,
-        size: desired.size,
+        price: Number(verifiedOrder.price),
+        size: Number(verifiedOrder.original_size),
         orderId: orderResult.orderId,
+        verified: true,
       });
     }
   }
