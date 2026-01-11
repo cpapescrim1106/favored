@@ -8,16 +8,19 @@ import {
   Search,
   ShoppingCart,
   PieChart,
+  BarChart3,
   Settings,
   ScrollText,
   AlertTriangle,
 } from "lucide-react";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { useQuery } from "@tanstack/react-query";
 
 const tabs = [
   { name: "Candidates", href: Paths.CANDIDATES, icon: Search },
   { name: "Basket", href: Paths.BASKET, icon: ShoppingCart },
   { name: "Portfolio", href: Paths.PORTFOLIO, icon: PieChart },
+  { name: "MM", href: Paths.MARKET_MAKING, icon: BarChart3 },
   { name: "Config", href: Paths.CONFIG, icon: Settings },
   { name: "Logs", href: Paths.LOGS, icon: ScrollText },
 ];
@@ -79,6 +82,7 @@ export default function DashboardLayout({
                   </Link>
                 );
               })}
+              <ThemeToggle />
             </nav>
           </div>
         </div>
