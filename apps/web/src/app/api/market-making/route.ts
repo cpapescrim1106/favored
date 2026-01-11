@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/db";
 import { NextRequest, NextResponse } from "next/server";
+import { getBalance } from "@favored/shared";
 
 /**
  * GET /api/market-making
@@ -32,10 +33,30 @@ export async function GET() {
       orderBy: { createdAt: "desc" },
     });
 
+    // Calculate unrealized P&L for each market maker
+    // Unrealized = (currentPrice - avgCost) × inventory
+    const calculateUnrealizedPnl = (mm: typeof marketMakers[0]) => {
+      const yesPrice = mm.market?.yesPrice ? Number(mm.market.yesPrice) : 0;
+      const noPrice = mm.market?.noPrice ? Number(mm.market.noPrice) : 0;
+      const yesInventory = Number(mm.yesInventory);
+      const noInventory = Number(mm.noInventory);
+      const avgYesCost = Number(mm.avgYesCost);
+      const avgNoCost = Number(mm.avgNoCost);
+
+      const yesUnrealized = yesInventory > 0 ? (yesPrice - avgYesCost) * yesInventory : 0;
+      const noUnrealized = noInventory > 0 ? (noPrice - avgNoCost) * noInventory : 0;
+
+      return yesUnrealized + noUnrealized;
+    };
+
     // Calculate totals
     const activeMakers = marketMakers.filter((mm) => mm.active && !mm.paused);
     const totalRealizedPnl = marketMakers.reduce(
       (sum, mm) => sum + Number(mm.realizedPnl),
+      0
+    );
+    const totalUnrealizedPnl = marketMakers.reduce(
+      (sum, mm) => sum + calculateUnrealizedPnl(mm),
       0
     );
     const totalOpenOrders = marketMakers.reduce(
@@ -52,6 +73,27 @@ export async function GET() {
       return nearMaxInventory || volatilityPaused;
     }).length;
 
+    // Total at risk: net loss after offsetting inventory at $1 payout
+    const totalAtRisk = marketMakers.reduce((sum, mm) => {
+      const yesInv = Number(mm.yesInventory);
+      const noInv = Number(mm.noInventory);
+      const yesCost = yesInv * Number(mm.avgYesCost);
+      const noCost = noInv * Number(mm.avgNoCost);
+      const totalCost = yesCost + noCost;
+      const minShares = Math.min(yesInv, noInv);
+      const netRisk = Math.max(0, totalCost - minShares);
+      return sum + netRisk;
+    }, 0);
+
+    // Fetch cash balance
+    let cashAvailable: number | null = null;
+    try {
+      const balanceData = await getBalance();
+      cashAvailable = balanceData?.balance ?? null;
+    } catch (e) {
+      // Silently fail - will show "—" in UI
+    }
+
     return NextResponse.json({
       mmEnabled: config?.mmEnabled ?? false,
       summary: {
@@ -60,6 +102,10 @@ export async function GET() {
         totalOpenOrders,
         marketsAtRisk,
         totalRealizedPnl,
+        totalUnrealizedPnl,
+        totalPnl: totalRealizedPnl + totalUnrealizedPnl,
+        totalAtRisk,
+        cashAvailable,
       },
       marketMakers: marketMakers.map((mm) => ({
         id: mm.id,
@@ -86,6 +132,8 @@ export async function GET() {
         avgYesCost: Number(mm.avgYesCost),
         avgNoCost: Number(mm.avgNoCost),
         realizedPnl: Number(mm.realizedPnl),
+        unrealizedPnl: calculateUnrealizedPnl(mm),
+        totalPnl: Number(mm.realizedPnl) + calculateUnrealizedPnl(mm),
         minTimeToResolution: mm.minTimeToResolution,
         volatilityPauseUntil: mm.volatilityPauseUntil?.toISOString() || null,
         orders: mm.orders.map((o) => ({
@@ -164,11 +212,11 @@ export async function POST(request: NextRequest) {
     const marketMaker = await prisma.marketMaker.create({
       data: {
         marketId,
-        targetSpread: targetSpread ?? Number(config?.mmDefaultSpread ?? 0.02),
+        targetSpread: targetSpread ?? Number(config?.mmDefaultSpread ?? 0.04),
         orderSize: orderSize ?? Number(config?.mmDefaultOrderSize ?? 100),
         maxInventory: maxInventory ?? Number(config?.mmDefaultMaxInventory ?? 500),
-        skewFactor: skewFactor ?? Number(config?.mmDefaultSkewFactor ?? 0.02),
-        quotingPolicy: quotingPolicy ?? config?.mmDefaultQuotingPolicy ?? "inside",
+        skewFactor: skewFactor ?? Number(config?.mmDefaultSkewFactor ?? 0.04),
+        quotingPolicy: quotingPolicy ?? config?.mmDefaultQuotingPolicy ?? "touch",
         minTimeToResolution: minTimeToResolution ?? config?.mmMinTimeToResolution ?? 24,
         active: true,
         paused: false,

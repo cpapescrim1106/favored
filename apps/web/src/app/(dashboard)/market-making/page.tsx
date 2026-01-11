@@ -50,6 +50,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
+import { SyncStatus } from "@/components/sync-status";
 
 interface MarketMakerOrder {
   outcome: string;
@@ -553,6 +554,7 @@ export default function MarketMakingPage() {
                             <SelectItem value="touch">Touch (at best bid/ask)</SelectItem>
                             <SelectItem value="inside">Inside (improve by 1 tick)</SelectItem>
                             <SelectItem value="back">Back (behind best)</SelectItem>
+                            <SelectItem value="defensive">Defensive (inventory-aware)</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -663,14 +665,17 @@ export default function MarketMakingPage() {
         </div>
       </div>
 
-      {/* Market Makers Table */}
-      <div className="border rounded-lg overflow-hidden">
-        <Table>
-          <TableHeader>
-            <TableRow className="bg-zinc-50 dark:bg-zinc-900">
-              <TableHead className="w-[220px]">Market</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead className="text-right">YES Bid</TableHead>
+      {/* Data Integrity Status */}
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        <div className="lg:col-span-3">
+          {/* Market Makers Table */}
+          <div className="border rounded-lg overflow-hidden">
+            <Table>
+              <TableHeader>
+                <TableRow className="bg-zinc-50 dark:bg-zinc-900">
+                  <TableHead className="w-[220px]">Market</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead className="text-right">YES Bid</TableHead>
               <TableHead className="text-right">YES Ask</TableHead>
               <TableHead className="text-right">NO Bid</TableHead>
               <TableHead className="text-right">NO Ask</TableHead>
@@ -823,6 +828,16 @@ export default function MarketMakingPage() {
                     >
                       <div className="font-bold">${mm.totalPnl.toFixed(2)}</div>
                       <div className="text-xs opacity-70">
+                        {mm.realizedPnl !== 0 && (
+                          <span>{mm.realizedPnl >= 0 ? "+" : ""}{mm.realizedPnl.toFixed(2)}r</span>
+                        )}
+                        {mm.realizedPnl !== 0 && mm.unrealizedPnl !== 0 && " / "}
+                        {mm.unrealizedPnl !== 0 && (
+                          <span>{mm.unrealizedPnl >= 0 ? "+" : ""}{mm.unrealizedPnl.toFixed(2)}u</span>
+                        )}
+                        {mm.realizedPnl === 0 && mm.unrealizedPnl === 0 && "—"}
+                      </div>
+                      <div className="text-xs opacity-70">
                         {deployed > 0
                           ? `${mm.totalPnl >= 0 ? "+" : ""}${((mm.totalPnl / deployed) * 100).toFixed(1)}%`
                           : "—"}
@@ -890,6 +905,13 @@ export default function MarketMakingPage() {
             )}
           </TableBody>
         </Table>
+          </div>
+        </div>
+
+        {/* Sync Status Sidebar */}
+        <div className="lg:col-span-1">
+          <SyncStatus />
+        </div>
       </div>
 
       {/* Edit Dialog */}
@@ -981,6 +1003,7 @@ export default function MarketMakingPage() {
                     <SelectItem value="touch">Touch (at best bid/ask)</SelectItem>
                     <SelectItem value="inside">Inside (improve by 1 tick)</SelectItem>
                     <SelectItem value="back">Back (behind best)</SelectItem>
+                    <SelectItem value="defensive">Defensive (inventory-aware)</SelectItem>
                   </SelectContent>
                 </Select>
               </div>

@@ -268,12 +268,12 @@ export default function ConfigPage() {
         <Card>
           <CardHeader>
             <CardTitle>Position Sizing</CardTitle>
-            <CardDescription>Control stake amounts per position</CardDescription>
+            <CardDescription>Control share amounts per position</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label>Default Stake ($)</Label>
+                <Label>Default Shares</Label>
                 <Input
                   type="number"
                   value={formData.defaultStake}
@@ -281,10 +281,11 @@ export default function ConfigPage() {
                     handleInputChange("defaultStake", Number(e.target.value))
                   }
                   min={0}
+                  step={50}
                 />
               </div>
               <div className="space-y-2">
-                <Label>Max per Market ($)</Label>
+                <Label>Max Shares per Market</Label>
                 <Input
                   type="number"
                   value={formData.maxStakePerMarket}
@@ -292,6 +293,7 @@ export default function ConfigPage() {
                     handleInputChange("maxStakePerMarket", Number(e.target.value))
                   }
                   min={0}
+                  step={50}
                 />
               </div>
             </div>

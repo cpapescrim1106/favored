@@ -3,6 +3,59 @@ import { NextRequest, NextResponse } from "next/server";
 
 const MAX_BATCH_SIZE = 15;
 
+// Bulk update all items in basket (adjust size by delta)
+export async function PATCH(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { sizeDelta } = body;
+
+    if (typeof sizeDelta !== "number") {
+      return NextResponse.json({ error: "sizeDelta required" }, { status: 400 });
+    }
+
+    // Get current draft basket
+    const basket = await prisma.basket.findFirst({
+      where: { status: "DRAFT" },
+      include: { items: true },
+      orderBy: { createdAt: "desc" },
+    });
+
+    if (!basket || basket.items.length === 0) {
+      return NextResponse.json({ error: "No basket found" }, { status: 404 });
+    }
+
+    // Update each item's stake based on size delta
+    for (const item of basket.items) {
+      const snapshotPrice = Number(item.snapshotPrice);
+      const currentSize = Number(item.stake) / snapshotPrice;
+      const newSize = Math.max(0, currentSize + sizeDelta);
+      const newStake = newSize * snapshotPrice;
+
+      await prisma.basketItem.update({
+        where: { id: item.id },
+        data: { stake: newStake },
+      });
+    }
+
+    // Recalculate totals
+    const updatedItems = await prisma.basketItem.findMany({
+      where: { basketId: basket.id },
+    });
+
+    const totalStake = updatedItems.reduce((sum, i) => sum + Number(i.stake), 0);
+
+    await prisma.basket.update({
+      where: { id: basket.id },
+      data: { totalStake },
+    });
+
+    return NextResponse.json({ success: true, totalStake });
+  } catch (error) {
+    console.error("Failed to bulk update basket:", error);
+    return NextResponse.json({ error: "Failed to update" }, { status: 500 });
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -39,11 +92,11 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Get config for default stake
+    // Get config for default shares
     const config = await prisma.config.findUnique({
       where: { id: "singleton" },
     });
-    const defaultStake = config ? Number(config.defaultStake) : 50;
+    const defaultShares = config ? Number(config.defaultStake) : 100;
 
     // Check if already in basket
     const existing = await prisma.basketItem.findFirst({
@@ -67,12 +120,15 @@ export async function POST(request: NextRequest) {
         ? Number(candidate.market.yesPrice || candidate.impliedProb)
         : Number(candidate.market.noPrice || candidate.impliedProb);
 
+    // Calculate stake from shares × price
+    const stake = defaultShares * snapshotPrice;
+
     const item = await prisma.basketItem.create({
       data: {
         basketId: basket.id,
         marketId: candidate.marketId,
         side: candidate.side,
-        stake: defaultStake,
+        stake,
         limitPrice: Number(candidate.impliedProb),
         snapshotPrice,
         status: "pending",

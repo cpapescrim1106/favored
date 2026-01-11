@@ -23,7 +23,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { Trash2, Play, AlertTriangle, ShoppingCart } from "lucide-react";
+import { Trash2, Play, AlertTriangle, ShoppingCart, Plus, Minus } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
 interface BasketItem {
@@ -148,6 +148,41 @@ export default function BasketPage() {
     },
   });
 
+  // Bulk adjust all items mutation
+  const bulkAdjustMutation = useMutation({
+    mutationFn: async (sizeDelta: number) => {
+      const res = await fetch("/api/basket/items", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sizeDelta }),
+      });
+      if (!res.ok) throw new Error("Failed to adjust");
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["basket"] });
+    },
+  });
+
+  // Individual item adjust mutation
+  const adjustItemMutation = useMutation({
+    mutationFn: async ({ itemId, size }: { itemId: string; size: number }) => {
+      const res = await fetch(`/api/basket/items/${itemId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ size }),
+      });
+      if (!res.ok) throw new Error("Failed to adjust item");
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["basket"] });
+    },
+  });
+
+  // Helper to calculate size from stake/price, rounded to nearest 50
+  const getSize = (item: BasketItem) => Math.round(item.stake / item.snapshotPrice / 50) * 50;
+
   // Group items by category
   const items = basket?.items || [];
   const groupedItems = items.reduce((acc, item) => {
@@ -174,13 +209,37 @@ export default function BasketPage() {
           </h1>
           {basket && (
             <p className="text-sm text-zinc-500">
-              {basket.itemCount ?? 0} items | {basket.batchCount ?? 0} batches | $
+              {basket.itemCount ?? 0} items | {items.reduce((sum, i) => sum + getSize(i), 0)} shares | $
               {(basket.totalStake ?? 0).toFixed(2)} total
             </p>
           )}
         </div>
         {basket && items.length > 0 && (
           <div className="flex items-center gap-2">
+            {/* Bulk adjust controls */}
+            <div className="flex items-center gap-1 border rounded-md px-2 py-1">
+              <span className="text-xs text-zinc-500 mr-1">All:</span>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                onClick={() => bulkAdjustMutation.mutate(-50)}
+                disabled={bulkAdjustMutation.isPending}
+              >
+                <Minus className="h-4 w-4" />
+              </Button>
+              <span className="text-xs font-mono w-8 text-center">±50</span>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                onClick={() => bulkAdjustMutation.mutate(50)}
+                disabled={bulkAdjustMutation.isPending}
+              >
+                <Plus className="h-4 w-4" />
+              </Button>
+            </div>
+
             <AlertDialog>
               <AlertDialogTrigger asChild>
                 <Button variant="outline" size="sm">
@@ -217,23 +276,31 @@ export default function BasketPage() {
                     <AlertTriangle className="h-5 w-5 text-yellow-500" />
                     Confirm Execution
                   </AlertDialogTitle>
-                  <AlertDialogDescription className="space-y-2">
-                    <p>
-                      This will place {basket.itemCount} orders totaling $
-                      {basket.totalStake.toFixed(2)}.
-                    </p>
-                    <p className="text-sm font-medium text-yellow-600">
-                      MVP0 Mode: Orders will be logged but NOT actually placed.
-                    </p>
+                  <AlertDialogDescription asChild>
+                    <div className="space-y-3">
+                      <p>
+                        This will place {basket.itemCount} orders totaling $
+                        {basket.totalStake.toFixed(2)}.
+                      </p>
+                      <p className="text-sm text-zinc-500">
+                        Strategy: <span className="font-mono">GTC + postOnly</span> (maker orders at bid)
+                      </p>
+                    </div>
                   </AlertDialogDescription>
                 </AlertDialogHeader>
-                <AlertDialogFooter>
+                <AlertDialogFooter className="flex-col sm:flex-row gap-2">
                   <AlertDialogCancel>Cancel</AlertDialogCancel>
                   <AlertDialogAction
                     onClick={() => executeMutation.mutate(true)}
+                    className="bg-zinc-600 hover:bg-zinc-700"
+                  >
+                    Dry Run
+                  </AlertDialogAction>
+                  <AlertDialogAction
+                    onClick={() => executeMutation.mutate(false)}
                     className="bg-green-600 hover:bg-green-700"
                   >
-                    Execute (Dry Run)
+                    Execute LIVE
                   </AlertDialogAction>
                 </AlertDialogFooter>
               </AlertDialogContent>
@@ -263,11 +330,11 @@ export default function BasketPage() {
         <Table>
           <TableHeader>
             <TableRow className="bg-zinc-50 dark:bg-zinc-900">
-              <TableHead className="w-[300px]">Market</TableHead>
+              <TableHead className="w-[280px]">Market</TableHead>
               <TableHead>Side</TableHead>
+              <TableHead className="text-center">Size</TableHead>
               <TableHead className="text-right">Stake</TableHead>
-              <TableHead className="text-right">Limit</TableHead>
-              <TableHead className="text-right">Snapshot</TableHead>
+              <TableHead className="text-right">Price</TableHead>
               <TableHead>Category</TableHead>
               <TableHead>Status</TableHead>
               <TableHead></TableHead>
@@ -291,60 +358,83 @@ export default function BasketPage() {
                 </TableCell>
               </TableRow>
             ) : (
-              items.map((item) => (
-                <TableRow key={item.id}>
-                  <TableCell className="font-medium">
-                    <span className="line-clamp-2" title={item.market.question}>
-                      {item.market.question}
-                    </span>
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant={item.side === "YES" ? "default" : "secondary"}>
-                      {item.side}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-right font-mono font-bold">
-                    ${item.stake.toFixed(2)}
-                  </TableCell>
-                  <TableCell className="text-right font-mono">
-                    ${item.limitPrice.toFixed(2)}
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-zinc-500">
-                    ${item.snapshotPrice.toFixed(2)}
-                  </TableCell>
-                  <TableCell>
-                    <Badge
-                      variant="outline"
-                      className={`text-xs ${categoryColors[item.market.category || "Other"] || categoryColors.Other}`}
-                    >
-                      {item.market.category || "—"}
-                    </Badge>
-                  </TableCell>
-                  <TableCell>
-                    <Badge
-                      variant={
-                        item.status === "pending"
-                          ? "outline"
-                          : item.status === "filled"
-                          ? "default"
-                          : "destructive"
-                      }
-                    >
-                      {item.status}
-                    </Badge>
-                  </TableCell>
-                  <TableCell>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => removeItemMutation.mutate(item.id)}
-                      disabled={removeItemMutation.isPending}
-                    >
-                      <Trash2 className="h-4 w-4 text-red-500" />
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))
+              items.map((item) => {
+                const size = getSize(item);
+                return (
+                  <TableRow key={item.id}>
+                    <TableCell className="font-medium">
+                      <span className="line-clamp-2" title={item.market.question}>
+                        {item.market.question}
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={item.side === "YES" ? "default" : "secondary"}>
+                        {item.side}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex items-center justify-center gap-1">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-6 w-6"
+                          onClick={() => adjustItemMutation.mutate({ itemId: item.id, size: Math.max(0, size - 50) })}
+                          disabled={adjustItemMutation.isPending || size <= 0}
+                        >
+                          <Minus className="h-3 w-3" />
+                        </Button>
+                        <span className="font-mono font-bold w-12 text-center">{size}</span>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-6 w-6"
+                          onClick={() => adjustItemMutation.mutate({ itemId: item.id, size: size + 50 })}
+                          disabled={adjustItemMutation.isPending}
+                        >
+                          <Plus className="h-3 w-3" />
+                        </Button>
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-zinc-500">
+                      ${item.stake.toFixed(2)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-zinc-500">
+                      ${item.snapshotPrice.toFixed(2)}
+                    </TableCell>
+                    <TableCell>
+                      <Badge
+                        variant="outline"
+                        className={`text-xs ${categoryColors[item.market.category || "Other"] || categoryColors.Other}`}
+                      >
+                        {item.market.category || "—"}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <Badge
+                        variant={
+                          item.status === "pending"
+                            ? "outline"
+                            : item.status === "filled"
+                            ? "default"
+                            : "destructive"
+                        }
+                      >
+                        {item.status}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => removeItemMutation.mutate(item.id)}
+                        disabled={removeItemMutation.isPending}
+                      >
+                        <Trash2 className="h-4 w-4 text-red-500" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                );
+              })
             )}
           </TableBody>
         </Table>

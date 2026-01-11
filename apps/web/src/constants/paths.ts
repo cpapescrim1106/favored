@@ -3,6 +3,7 @@ export const Paths = {
   CANDIDATES: "/candidates",
   BASKET: "/basket",
   PORTFOLIO: "/portfolio",
+  MARKET_MAKING: "/market-making",
   CONFIG: "/config",
   LOGS: "/logs",
 } as const;
