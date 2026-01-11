@@ -25,6 +25,7 @@ import {
   fetchActiveOrders,
   configureCLOB,
   getOrder,
+  getPositions,
 } from "@favored/shared";
 import {
   calculateQuotes,
@@ -1031,7 +1032,8 @@ async function processMarketMaker(
           tokenId: desired.tokenId,
           price: desired.price,
           size: desired.size,
-          lastMatchedSize: 0,
+          // Don't set lastMatchedSize - leave as null for baseline detection
+          // The fill detection logic will set the baseline on first getOrder() call
         },
       });
       result.quotesPlaced++;
@@ -1142,5 +1144,157 @@ export async function stopAllMarketMaking(): Promise<{ cancelled: number }> {
   } catch (error) {
     console.error("[MarketMaking] Error stopping MM:", error);
     throw error;
+  }
+}
+
+/**
+ * Reconciliation result for a single market
+ */
+interface ReconciliationDrift {
+  marketId: string;
+  slug: string;
+  outcome: "YES" | "NO";
+  dbInventory: number;
+  chainPosition: number;
+  drift: number;
+  driftPercent: number;
+}
+
+/**
+ * Reconcile DB inventory against on-chain positions
+ *
+ * Compares what we think we have (DB) vs what's actually on-chain (Data API).
+ * If drift exceeds threshold, logs warning and optionally pauses MM.
+ *
+ * @param driftThreshold - Max allowed drift as percentage (default 0.10 = 10%)
+ * @param pauseOnDrift - Whether to pause MM if drift exceeds threshold (default true)
+ */
+export async function reconcileInventory(
+  driftThreshold = 0.10,
+  pauseOnDrift = true
+): Promise<{ drifts: ReconciliationDrift[]; paused: boolean }> {
+  console.log("[Reconciliation] Starting inventory reconciliation...");
+
+  const drifts: ReconciliationDrift[] = [];
+  let shouldPause = false;
+
+  try {
+    // Fetch on-chain positions from Polymarket Data API
+    const chainPositions = await getPositions();
+
+    if (chainPositions.length === 0) {
+      console.log("[Reconciliation] No on-chain positions found");
+    }
+
+    // Build a map of tokenId -> chain position size
+    const chainPositionMap = new Map<string, number>();
+    for (const pos of chainPositions) {
+      chainPositionMap.set(pos.asset, pos.size);
+    }
+
+    // Get all active market makers with their markets
+    const marketMakers = await prisma.marketMaker.findMany({
+      where: { active: true },
+      include: { market: true },
+    });
+
+    for (const mm of marketMakers) {
+      const yesTokenId = mm.market.clobTokenIds[0];
+      const noTokenId = mm.market.clobTokenIds[1];
+
+      // Check YES inventory
+      if (yesTokenId) {
+        const dbInventory = Number(mm.yesInventory);
+        const chainPosition = chainPositionMap.get(yesTokenId) ?? 0;
+        const drift = Math.abs(dbInventory - chainPosition);
+        const driftPercent = dbInventory > 0 ? drift / dbInventory : (chainPosition > 0 ? 1 : 0);
+
+        if (drift > 0.01 || driftPercent > driftThreshold) {
+          drifts.push({
+            marketId: mm.marketId,
+            slug: mm.market.slug,
+            outcome: "YES",
+            dbInventory,
+            chainPosition,
+            drift,
+            driftPercent,
+          });
+
+          if (driftPercent > driftThreshold) {
+            console.error(
+              `[Reconciliation] DRIFT DETECTED: ${mm.market.slug} YES - DB: ${dbInventory.toFixed(2)}, Chain: ${chainPosition.toFixed(2)}, Drift: ${(driftPercent * 100).toFixed(1)}%`
+            );
+            shouldPause = true;
+          }
+        }
+      }
+
+      // Check NO inventory
+      if (noTokenId) {
+        const dbInventory = Number(mm.noInventory);
+        const chainPosition = chainPositionMap.get(noTokenId) ?? 0;
+        const drift = Math.abs(dbInventory - chainPosition);
+        const driftPercent = dbInventory > 0 ? drift / dbInventory : (chainPosition > 0 ? 1 : 0);
+
+        if (drift > 0.01 || driftPercent > driftThreshold) {
+          drifts.push({
+            marketId: mm.marketId,
+            slug: mm.market.slug,
+            outcome: "NO",
+            dbInventory,
+            chainPosition,
+            drift,
+            driftPercent,
+          });
+
+          if (driftPercent > driftThreshold) {
+            console.error(
+              `[Reconciliation] DRIFT DETECTED: ${mm.market.slug} NO - DB: ${dbInventory.toFixed(2)}, Chain: ${chainPosition.toFixed(2)}, Drift: ${(driftPercent * 100).toFixed(1)}%`
+            );
+            shouldPause = true;
+          }
+        }
+      }
+    }
+
+    // Pause MM if drift exceeds threshold
+    if (shouldPause && pauseOnDrift) {
+      console.error("[Reconciliation] Pausing all market makers due to inventory drift");
+      await prisma.marketMaker.updateMany({
+        where: { active: true },
+        data: { paused: true },
+      });
+
+      // Log to quote history
+      for (const drift of drifts.filter(d => d.driftPercent > driftThreshold)) {
+        const mm = marketMakers.find(m => m.marketId === drift.marketId);
+        if (mm) {
+          await prisma.quoteHistory.create({
+            data: {
+              marketMakerId: mm.id,
+              action: "DRIFT_PAUSE",
+              outcome: drift.outcome,
+              metadata: {
+                dbInventory: drift.dbInventory,
+                chainPosition: drift.chainPosition,
+                drift: drift.drift,
+                driftPercent: drift.driftPercent,
+              },
+            },
+          });
+        }
+      }
+    }
+
+    if (drifts.length === 0) {
+      console.log("[Reconciliation] All inventories match on-chain positions");
+    } else {
+      console.log(`[Reconciliation] Found ${drifts.length} inventory discrepancies`);
+    }
+
+    return { drifts, paused: shouldPause && pauseOnDrift };
+  } catch (error) {
+    console.error("[Reconciliation] Error during reconciliation:", error);
+    return { drifts: [], paused: false };
   }
 }
