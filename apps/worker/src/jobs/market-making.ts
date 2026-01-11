@@ -26,6 +26,7 @@ import {
   configureCLOB,
   getOrder,
   getPositions,
+  getBalance,
 } from "@favored/shared";
 import {
   calculateQuotes,
@@ -50,6 +51,12 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // Order verification settings
 const ORDER_VERIFICATION_RETRIES = 3;
 const ORDER_VERIFICATION_BACKOFF_MS = 200;
+
+// Cached data for the MM cycle - fetch expensive data once at start
+interface CycleContext {
+  balance: { balance: number; allowance: number } | null;
+  openOrders: Awaited<ReturnType<typeof fetchActiveOrders>>;
+}
 
 // ============================================================================
 // SANITY CHECK THRESHOLDS
@@ -145,13 +152,30 @@ export async function runMarketMakingJob(): Promise<MarketMakingResult> {
 
     const refreshThreshold = Number(config.mmRefreshThreshold);
 
+    // CACHE EXPENSIVE API CALLS AT START OF CYCLE
+    // This prevents multiple calls per MM and ensures consistent data across the cycle
+    const [balance, openClobOrders] = await Promise.all([
+      getBalance(),
+      fetchActiveOrders(),
+    ]);
+
+    const cycleContext: CycleContext = {
+      balance,
+      openOrders: openClobOrders,
+    };
+
+    console.log(
+      `[MarketMaking] Cycle context: balance=${balance?.balance?.toFixed(2) ?? 'unknown'}, ` +
+      `openOrders=${openClobOrders.length}`
+    );
+
     // First, check for fills across all market makers
-    await checkAllFills(marketMakers, result);
+    await checkAllFills(marketMakers, result, cycleContext);
 
     // Process each market maker
     for (const mm of marketMakers) {
       try {
-        await processMarketMaker(mm, config, refreshThreshold, result);
+        await processMarketMaker(mm, config, refreshThreshold, result, cycleContext);
         result.processed++;
       } catch (error) {
         const errorMsg = `Failed to process MM ${mm.id} (${mm.market?.slug}): ${error instanceof Error ? error.message : String(error)}`;
@@ -188,11 +212,12 @@ export async function runMarketMakingJob(): Promise<MarketMakingResult> {
  */
 async function checkAllFills(
   marketMakers: Awaited<ReturnType<typeof prisma.marketMaker.findMany>>,
-  result: MarketMakingResult
+  result: MarketMakingResult,
+  cycleContext: CycleContext
 ): Promise<void> {
   try {
-    // Fetch all open orders from CLOB
-    const openOrders = await fetchActiveOrders();
+    // Use cached open orders from cycle context
+    const openOrders = cycleContext.openOrders;
     const openOrderIds = new Set(openOrders.map((o) => o.id));
     const trackedOrdersCount = marketMakers.reduce((sum, mm) => {
       if (!("orders" in mm) || !Array.isArray(mm.orders)) return sum;
@@ -516,7 +541,8 @@ async function processMarketMaker(
   },
   config: Awaited<ReturnType<typeof prisma.config.findUnique>>,
   refreshThreshold: number,
-  result: MarketMakingResult
+  result: MarketMakingResult,
+  cycleContext: CycleContext
 ): Promise<void> {
   if (!mm || !mm.market || !config) return;
 
@@ -555,6 +581,24 @@ async function processMarketMaker(
     console.log(`[MarketMaking] No clobTokenIds for ${mm.market.slug}, skipping`);
     return;
   }
+
+  // COMPUTE RESERVED AMOUNTS from existing open orders
+  // Used for pre-order balance and position checks
+  const existingOrders = mm.orders || [];
+
+  // Reserved buy exposure = sum of (price * size) for all outstanding BID orders
+  const reservedBuyExposure = existingOrders
+    .filter((o) => o.side === "BID")
+    .reduce((sum, o) => sum + Number(o.price) * Number(o.size), 0);
+
+  // Reserved sell inventory per outcome = sum of size for all outstanding ASK orders
+  const reservedSellYes = existingOrders
+    .filter((o) => o.side === "ASK" && o.outcome === "YES")
+    .reduce((sum, o) => sum + Number(o.size), 0);
+
+  const reservedSellNo = existingOrders
+    .filter((o) => o.side === "ASK" && o.outcome === "NO")
+    .reduce((sum, o) => sum + Number(o.size), 0);
 
   // Fetch midpoint, spread, and best bid/ask from CLOB (YES + NO)
   const [
@@ -752,7 +796,7 @@ async function processMarketMaker(
     ? Date.now() - mm.lastQuoteAt.getTime()
     : Infinity;
 
-  const existingOrders = mm.orders || [];
+  // existingOrders already computed earlier for reserved amounts
   const hasAllOrders = existingOrders.length >= 4; // YES bid/ask + NO bid/ask
 
   const previousMidPrice = mm.market.yesPrice ? Number(mm.market.yesPrice) : 0.5;
@@ -1066,6 +1110,55 @@ async function processMarketMaker(
     const [outcome, side, tierStr] = key.split("-");
     const tier = parseInt(tierStr, 10);
     const orderSide = side === "BID" ? "BUY" : "SELL";
+    const isYesOutcome = outcome === "YES";
+
+    // PRE-ORDER GATES: Check balance/position before placing order
+    if (orderSide === "BUY") {
+      // BALANCE GATE: Check if we have enough USDC (with reserved exposure)
+      const requiredUsdc = desired.price * desired.size;
+      const totalBalance = cycleContext.balance?.balance ?? 0;
+      const availableBalance = totalBalance - reservedBuyExposure;
+
+      if (availableBalance < requiredUsdc) {
+        console.warn(
+          `[MarketMaking] BALANCE GATE: ${mm.market.slug} ${outcome} BID requires $${requiredUsdc.toFixed(2)}, ` +
+          `available=$${availableBalance.toFixed(2)} (total=$${totalBalance.toFixed(2)}, reserved=$${reservedBuyExposure.toFixed(2)})`
+        );
+        await logQuoteAction(mm.id, "INSUFFICIENT_BALANCE", {
+          outcome,
+          side,
+          tier,
+          requiredUsdc,
+          totalBalance,
+          reserved: reservedBuyExposure,
+          available: availableBalance,
+        });
+        continue;
+      }
+    } else {
+      // POSITION GATE: Check if we have enough inventory to sell (with reserved sells)
+      const dbInventory = isYesOutcome ? Number(mm.yesInventory) : Number(mm.noInventory);
+      const reserved = isYesOutcome ? reservedSellYes : reservedSellNo;
+      const availableInventory = dbInventory - reserved;
+
+      // Allow some tolerance (90%) to account for rounding
+      if (availableInventory < desired.size * 0.9) {
+        console.warn(
+          `[MarketMaking] POSITION GATE: ${mm.market.slug} ${outcome} ASK requires ${desired.size.toFixed(2)}, ` +
+          `available=${availableInventory.toFixed(2)} (inventory=${dbInventory.toFixed(2)}, reserved=${reserved.toFixed(2)})`
+        );
+        await logQuoteAction(mm.id, "INSUFFICIENT_POSITION", {
+          outcome,
+          side,
+          tier,
+          required: desired.size,
+          dbInventory,
+          reserved,
+          available: availableInventory,
+        });
+        continue;
+      }
+    }
 
     const orderResult = await placeOrder({
       tokenId: desired.tokenId,
@@ -1126,7 +1219,12 @@ async function processMarketMaker(
       }
 
       // Verified - use values from CLOB verification
-      const verifiedOrder = verificationResult!.order!;
+      // Type guard: verified is true only when verificationResult.status === "ok"
+      if (verificationResult?.status !== "ok" || !verificationResult.order) {
+        // This shouldn't happen, but TypeScript needs the check
+        continue;
+      }
+      const verifiedOrder = verificationResult.order;
       await prisma.marketMakerOrder.create({
         data: {
           marketMakerId: mm.id,

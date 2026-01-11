@@ -432,11 +432,27 @@ export async function placeOrder(order: OrderRequest): Promise<OrderResponse> {
       orderOptions.expiration = order.expiration;
     }
 
-    if (order.side === "SELL") {
-      await client.updateBalanceAllowance({
-        asset_type: AssetType.CONDITIONAL,
-        token_id: order.tokenId,
-      });
+    // Update allowances before placing order
+    try {
+      if (order.side === "SELL") {
+        // SELL orders need CONDITIONAL token approval
+        console.log(`[CLOB] Updating CONDITIONAL allowance for token ${order.tokenId.slice(0, 12)}...`);
+        await client.updateBalanceAllowance({
+          asset_type: AssetType.CONDITIONAL,
+          token_id: order.tokenId,
+        });
+        console.log("[CLOB] CONDITIONAL allowance updated");
+      } else {
+        // BUY orders need COLLATERAL (USDC) approval
+        console.log("[CLOB] Updating COLLATERAL (USDC) allowance...");
+        await client.updateBalanceAllowance({
+          asset_type: AssetType.COLLATERAL,
+        });
+        console.log("[CLOB] COLLATERAL allowance updated");
+      }
+    } catch (allowanceError) {
+      console.error("[CLOB] Failed to update allowance:", allowanceError);
+      // Continue anyway - allowance might already be set
     }
 
     // Create and sign order
