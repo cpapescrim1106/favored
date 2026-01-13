@@ -27,6 +27,6 @@ export interface VenueAdapter {
   getOpenOrders(venueMarketId?: string): Promise<OrderResponse[]>;
   getPositions(params?: Record<string, unknown>): Promise<VenuePosition[]>;
   getFills(params?: { sinceTs?: number }): Promise<VenueFill[]>;
-  createOrderGroup?(params: { name?: string; cancelOnLimit?: boolean }): Promise<string>;
+  createOrderGroup?(params: { contractsLimit: number }): Promise<string>;
   resetOrderGroup?(orderGroupId: string): Promise<boolean>;
 }
