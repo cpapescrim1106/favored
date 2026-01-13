@@ -14,11 +14,18 @@ datasource db {
 // MARKET DATA
 // ============================================================================
 
+enum Venue {
+  POLYMARKET
+  KALSHI
+}
+
 /// Polymarket market data (synced from Gamma API)
 model Market {
-  id        String    @id // Polymarket condition_id
-  slug      String    @unique
+  id        String    @id // Polymarket condition_id or Kalshi ticker
+  venue     Venue     @default(POLYMARKET)
+  slug      String
   eventSlug String?   // Parent event slug for Polymarket URL
+  eventTicker String? // Parent event ticker for Kalshi
   question  String
   category  String?
   endDate   DateTime?
@@ -35,6 +42,10 @@ model Market {
   // CLOB token IDs for orderbook access (YES token, NO token)
   clobTokenIds String[] @default([])
 
+  // Kalshi tick structure (stored from market metadata)
+  priceLevelStructure String?
+  priceRanges         Json?
+
   // Relations
   candidates  Candidate[]
   basketItems BasketItem[]
@@ -47,6 +58,7 @@ model Market {
   @@index([active])
   @@index([category])
   @@index([endDate])
+  @@unique([venue, slug])
   @@map("markets")
 }
 
@@ -215,7 +227,9 @@ model MarketMaker {
   orderSize     Decimal @db.Decimal(18, 6) // Shares per side
   maxInventory  Decimal @db.Decimal(18, 6) // Max shares exposure per outcome
   skewFactor    Decimal @db.Decimal(5, 4) // Max price shift at full inventory
-  quotingPolicy String  @default("touch") // "touch", "inside", "back", "defensive"
+  quotingPolicy String  @default("touch") // "touch", "inside", "back", "defensive", "offsets"
+  bidOffsetTicks Int? // Ticks behind best bid (null = use policy)
+  askOffsetTicks Int? // Ticks above best ask (null = use policy)
 
   // Dual-outcome inventory (in shares)
   yesInventory Decimal @default(0) @db.Decimal(18, 6) // YES token position
@@ -254,6 +268,8 @@ model MarketMakerOrder {
   side    String // "BID" or "ASK"
   tier    Int    @default(0) // Tier level: 0 = closest to mid, 1 = next level, etc.
   orderId String // CLOB order ID
+  clientOrderId String?
+  orderGroupId  String?
   tokenId String // Token ID for this outcome
   price   Decimal @db.Decimal(10, 6)
   size    Decimal @db.Decimal(18, 6) // Shares
@@ -278,6 +294,7 @@ model MarketMakerFill {
   outcome    String // "YES" or "NO"
   side       String // "BUY" or "SELL"
   orderId    String // CLOB order ID that was filled
+  clientOrderId String?
   price      Decimal @db.Decimal(10, 6)
   size       Decimal @db.Decimal(18, 6) // Shares filled
   value      Decimal @db.Decimal(18, 6) // price * size

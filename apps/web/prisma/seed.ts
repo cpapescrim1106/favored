@@ -1,6 +1,17 @@
 import { PrismaClient } from "../src/generated/prisma/index.js";
+import { PrismaPg } from "@prisma/adapter-pg";
+import pg from "pg";
 
-const prisma = new PrismaClient();
+const { Pool } = pg;
+
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  throw new Error("DATABASE_URL environment variable is required for seeding");
+}
+
+const pool = new Pool({ connectionString });
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter });
 
 async function main() {
   console.log("Seeding database...");
