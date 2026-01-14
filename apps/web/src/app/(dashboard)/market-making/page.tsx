@@ -14,6 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -25,14 +26,12 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   BarChart3,
   Plus,
@@ -69,6 +68,8 @@ interface MarketMaker {
     category: string | null;
     yesPrice: number | null;
     noPrice: number | null;
+    yesBestBid: number | null;
+    noBestBid: number | null;
     endDate: string | null;
   } | null;
   active: boolean;
@@ -77,7 +78,8 @@ interface MarketMaker {
   orderSize: number;
   maxInventory: number;
   skewFactor: number;
-  quotingPolicy: string;
+  bidOffsetTicks: number | null;
+  askOffsetTicks: number | null;
   yesInventory: number;
   noInventory: number;
   avgYesCost: number;
@@ -85,12 +87,27 @@ interface MarketMaker {
   realizedPnl: number;
   unrealizedPnl: number;
   totalPnl: number;
+  pnl24h: number;
+  pnl1w: number;
   minTimeToResolution: number;
   volatilityPauseUntil: string | null;
   orders: MarketMakerOrder[];
   fillCount: number;
+  lastFillAt: string | null;
   lastQuoteAt: string | null;
   createdAt: string;
+}
+
+interface Fill {
+  id: string;
+  orderId: string;
+  marketSlug: string;
+  marketQuestion: string;
+  outcome: string;
+  side: string;
+  size: number;
+  price: number;
+  filledAt: string;
 }
 
 interface MarketMakingData {
@@ -109,6 +126,11 @@ interface MarketMakingData {
   marketMakers: MarketMaker[];
 }
 
+interface FillsResponse {
+  count: number;
+  fills: Fill[];
+}
+
 interface MMCandidate {
   marketId: string;
   slug: string;
@@ -122,12 +144,16 @@ interface MMCandidate {
   depth3c: number;
   bookSlope: number;
   volume24h: number;
+  queueSpeed: number;
+  queueDepthRatio: number;
   hoursToEnd: number | null;
   scores: {
     liquidity: number;
     flow: number;
     time: number;
     priceZone: number;
+    queueSpeed: number;
+    queueDepth: number;
     total: number;
   };
   flags: string[];
@@ -140,18 +166,46 @@ interface MMCandidatesData {
   candidates: MMCandidate[];
 }
 
+interface FormValues {
+  useOffsets: boolean;
+  targetSpread: number;
+  orderSize: number;
+  maxInventory: number;
+  skewFactor: number;
+  bidOffsetTicks: number | null;
+  askOffsetTicks: number | null;
+  minTimeToResolution: number;
+}
+
 export default function MarketMakingPage() {
   const queryClient = useQueryClient();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [editingMM, setEditingMM] = useState<MarketMaker | null>(null);
   const [selectedCandidate, setSelectedCandidate] = useState<MMCandidate | null>(null);
   const [dialogStep, setDialogStep] = useState<"select" | "configure">("select");
-  const [formValues, setFormValues] = useState({
+  const [pnlWindow, setPnlWindow] = useState<"24h" | "1w" | "all">("24h");
+  const [bulkDialogOpen, setBulkDialogOpen] = useState(false);
+  const [bulkApplyToAll, setBulkApplyToAll] = useState(false);
+  const [fillsOpen, setFillsOpen] = useState(false);
+  const [selectedMarketIds, setSelectedMarketIds] = useState<string[]>([]);
+  const [formValues, setFormValues] = useState<FormValues>({
+    useOffsets: true,
     targetSpread: 0.04,
     orderSize: 100,
     maxInventory: 500,
     skewFactor: 0.04,
-    quotingPolicy: "touch",
+    bidOffsetTicks: 1,
+    askOffsetTicks: 0,
+    minTimeToResolution: 24,
+  });
+  const [bulkValues, setBulkValues] = useState<FormValues>({
+    useOffsets: true,
+    targetSpread: 0.04,
+    orderSize: 100,
+    maxInventory: 500,
+    skewFactor: 0.04,
+    bidOffsetTicks: 1,
+    askOffsetTicks: 0,
     minTimeToResolution: 24,
   });
 
@@ -166,6 +220,19 @@ export default function MarketMakingPage() {
     refetchInterval: 3000,
     refetchIntervalInBackground: true,
     refetchOnWindowFocus: true,
+  });
+
+  const { data: fillsData, isLoading: fillsLoading } = useQuery<FillsResponse>({
+    queryKey: ["market-making-fills-24h-asks"],
+    queryFn: async () => {
+      const res = await fetch("/api/market-making/fills");
+      if (!res.ok) throw new Error("Failed to fetch fills");
+      return res.json();
+    },
+    enabled: fillsOpen,
+    refetchInterval: fillsOpen ? 10000 : false,
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: false,
   });
 
   // Fetch MM candidates when dialog opens
@@ -202,10 +269,20 @@ export default function MarketMakingPage() {
   // Create market maker
   const createMM = useMutation({
     mutationFn: async (data: { marketId: string } & typeof formValues) => {
+      const payload = {
+        marketId: data.marketId,
+        targetSpread: data.targetSpread,
+        orderSize: data.orderSize,
+        maxInventory: data.maxInventory,
+        skewFactor: data.skewFactor,
+        minTimeToResolution: data.minTimeToResolution,
+        bidOffsetTicks: data.useOffsets ? data.bidOffsetTicks ?? 1 : null,
+        askOffsetTicks: data.useOffsets ? data.askOffsetTicks ?? 0 : null,
+      };
       const res = await fetch("/api/market-making", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) {
         const error = await res.json();
@@ -226,10 +303,26 @@ export default function MarketMakingPage() {
       id,
       ...data
     }: { id: string } & Partial<typeof formValues & { paused: boolean; active: boolean; volatilityPauseUntil: string | null }>) => {
+      const payload = {
+        ...data,
+        bidOffsetTicks:
+          data.useOffsets === undefined
+            ? undefined
+            : data.useOffsets
+            ? data.bidOffsetTicks ?? 1
+            : null,
+        askOffsetTicks:
+          data.useOffsets === undefined
+            ? undefined
+            : data.useOffsets
+            ? data.askOffsetTicks ?? 0
+            : null,
+      };
+      delete (payload as { useOffsets?: boolean }).useOffsets;
       const res = await fetch(`/api/market-making/${id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error("Failed to update market maker");
       return res.json();
@@ -237,6 +330,35 @@ export default function MarketMakingPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["market-making"] });
       setEditingMM(null);
+    },
+  });
+
+  const bulkUpdateMM = useMutation({
+    mutationFn: async (payload: {
+      applyToAll: boolean;
+      ids: string[];
+      updates: {
+        targetSpread?: number;
+        orderSize?: number;
+        maxInventory?: number;
+        skewFactor?: number;
+        bidOffsetTicks?: number | null;
+        askOffsetTicks?: number | null;
+        minTimeToResolution?: number;
+      };
+    }) => {
+      const res = await fetch("/api/market-making/bulk", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error("Failed to bulk update market makers");
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["market-making"] });
+      setSelectedMarketIds([]);
+      setBulkDialogOpen(false);
     },
   });
 
@@ -283,6 +405,9 @@ export default function MarketMakingPage() {
     totalAtRisk: 0,
     cashAvailable: null,
   };
+  const fillsAll = fillsData?.fills || [];
+  const fillsTotalCount = fillsData?.count ?? null;
+  const fillsCountLabel = fillsTotalCount === null ? "—" : fillsTotalCount;
   const marketMakers = data?.marketMakers || [];
   const mmEnabled = data?.mmEnabled || false;
   const candidates = candidatesData?.candidates || [];
@@ -291,10 +416,44 @@ export default function MarketMakingPage() {
     const noCost = mm.noInventory * mm.avgNoCost;
     return sum + yesCost + noCost;
   }, 0);
+  const marketMakerOrder = new Map(
+    marketMakers.map((mm, index) => [mm.id, index])
+  );
+  const sortedMarketMakers = [...marketMakers].sort((a, b) => {
+    const aHasInventory =
+      Math.abs(a.yesInventory) > 0.0001 || Math.abs(a.noInventory) > 0.0001;
+    const bHasInventory =
+      Math.abs(b.yesInventory) > 0.0001 || Math.abs(b.noInventory) > 0.0001;
+    if (aHasInventory !== bHasInventory) {
+      return aHasInventory ? -1 : 1;
+    }
+    return (marketMakerOrder.get(a.id) ?? 0) - (marketMakerOrder.get(b.id) ?? 0);
+  });
+  const selectedMarketIdSet = new Set(selectedMarketIds);
+  const hasSelections = selectedMarketIds.length > 0;
+  const allSelected =
+    marketMakers.length > 0 && selectedMarketIds.length === marketMakers.length;
 
   // Helper to get order by outcome and side
   const getOrder = (mm: MarketMaker, outcome: string, side: string) => {
     return mm.orders.find((o) => o.outcome === outcome && o.side === side);
+  };
+
+  const toggleMarketSelection = (marketId: string, checked: boolean) => {
+    setSelectedMarketIds((prev) => {
+      if (checked) {
+        return prev.includes(marketId) ? prev : [...prev, marketId];
+      }
+      return prev.filter((id) => id !== marketId);
+    });
+  };
+
+  const toggleSelectAll = (checked: boolean) => {
+    if (checked) {
+      setSelectedMarketIds(marketMakers.map((mm) => mm.id));
+    } else {
+      setSelectedMarketIds([]);
+    }
   };
 
   // Check if volatility paused
@@ -309,6 +468,51 @@ export default function MarketMakingPage() {
     if (score >= 50) return "text-yellow-600";
     return "text-red-600";
   };
+
+  // Staleness indicator: hours since last fill
+  // Returns: null (no fills), or hours since last fill
+  const getHoursSinceLastFill = (mm: MarketMaker): number | null => {
+    if (!mm.lastFillAt) return null;
+    const lastFill = new Date(mm.lastFillAt);
+    const now = new Date();
+    return (now.getTime() - lastFill.getTime()) / (1000 * 60 * 60);
+  };
+
+  // Staleness row background color based on hours since last fill (or hours bidding if no fills)
+  // < 12h: normal, 12-24h: yellow tint, 24-48h: orange tint, > 48h: red tint
+  const getStaleRowClass = (mm: MarketMaker): string => {
+    // Only apply staleness if market has inventory OR active orders (trying to get filled)
+    const hasInventory = Math.abs(mm.yesInventory) > 0.001 || Math.abs(mm.noInventory) > 0.001;
+    const hasOrders = mm.orders.length > 0;
+    if (!hasInventory && !hasOrders) return "";
+
+    const hours = getHoursSinceLastFill(mm);
+    if (hours === null) {
+      // No fills yet - use time since creation if we have orders out
+      if (!hasOrders) return "";
+      const createdAt = new Date(mm.createdAt);
+      const hoursSinceCreation = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60);
+      if (hoursSinceCreation >= 48) return "bg-red-50 dark:bg-red-950/30";
+      if (hoursSinceCreation >= 24) return "bg-orange-50 dark:bg-orange-950/30";
+      if (hoursSinceCreation >= 12) return "bg-amber-50 dark:bg-amber-950/30";
+      return "";
+    }
+    if (hours >= 48) return "bg-red-50 dark:bg-red-950/30";
+    if (hours >= 24) return "bg-orange-50 dark:bg-orange-950/30";
+    if (hours >= 12) return "bg-amber-50 dark:bg-amber-950/30";
+    return "";
+  };
+
+  const pnlWindowLabel = pnlWindow === "24h" ? "24h" : pnlWindow === "1w" ? "1W" : "All";
+  const getWindowPnl = (mm: MarketMaker) => {
+    if (pnlWindow === "24h") return mm.pnl24h;
+    if (pnlWindow === "1w") return mm.pnl1w;
+    return mm.realizedPnl;
+  };
+  const windowPnlTotal =
+    pnlWindow === "all"
+      ? summary.totalPnl
+      : marketMakers.reduce((sum, mm) => sum + getWindowPnl(mm), 0);
 
   return (
     <div className="space-y-4">
@@ -325,6 +529,27 @@ export default function MarketMakingPage() {
         </div>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2">
+            <span className="text-xs text-zinc-500 uppercase">P&L Window</span>
+            <div className="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1">
+              {[
+                { value: "24h", label: "24h" },
+                { value: "1w", label: "1W" },
+                { value: "all", label: "All" },
+              ].map((option) => (
+                <Button
+                  key={option.value}
+                  type="button"
+                  variant={pnlWindow === option.value ? "secondary" : "ghost"}
+                  size="sm"
+                  className="h-7 px-2"
+                  onClick={() => setPnlWindow(option.value as "24h" | "1w" | "all")}
+                >
+                  {option.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
             <Label htmlFor="mm-enabled" className="text-sm">
               MM Enabled
             </Label>
@@ -335,6 +560,7 @@ export default function MarketMakingPage() {
               disabled={toggleMM.isPending}
             />
           </div>
+          <SyncStatus />
           <Button
             variant="outline"
             size="sm"
@@ -344,6 +570,209 @@ export default function MarketMakingPage() {
             <RefreshCw className={`h-4 w-4 mr-1 ${isLoading ? "animate-spin" : ""}`} />
             Refresh
           </Button>
+          <Dialog open={bulkDialogOpen} onOpenChange={setBulkDialogOpen}>
+            <DialogTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+              >
+                <Settings className="h-4 w-4 mr-1" />
+                Bulk Edit
+                {hasSelections ? ` (${selectedMarketIds.length})` : ""}
+              </Button>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Bulk Update Market Makers</DialogTitle>
+                <DialogDescription>
+                  Update settings for selected markets or apply globally.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="grid gap-4 py-2">
+                <div className="flex items-center justify-between rounded-lg border border-zinc-200 dark:border-zinc-800 p-3">
+                  <div>
+                    <div className="text-sm font-medium">Apply to all markets</div>
+                    <div className="text-xs text-zinc-500">
+                      Overrides selection and updates every market maker.
+                    </div>
+                  </div>
+                  <Switch
+                    checked={bulkApplyToAll}
+                    onCheckedChange={setBulkApplyToAll}
+                  />
+                </div>
+                {!bulkApplyToAll && (
+                  <div className="text-sm text-zinc-500">
+                    {hasSelections
+                      ? `${selectedMarketIds.length} market(s) selected`
+                      : "Select markets from the table to enable bulk updates."}
+                  </div>
+                )}
+                <div className="flex items-center justify-between rounded-lg border border-zinc-200 dark:border-zinc-800 p-3">
+                  <div>
+                    <div className="text-sm font-medium">Use Bid/Ask Offsets</div>
+                    <div className="text-xs text-zinc-500">
+                      Toggle between offsets and target spread
+                    </div>
+                  </div>
+                  <Switch
+                    checked={bulkValues.useOffsets}
+                    onCheckedChange={(checked) =>
+                      setBulkValues({ ...bulkValues, useOffsets: checked })
+                    }
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  {bulkValues.useOffsets ? (
+                    <>
+                      <div className="grid gap-2">
+                        <Label htmlFor="bulk-bidOffsetTicks">Bid Offset (ticks)</Label>
+                        <Input
+                          id="bulk-bidOffsetTicks"
+                          type="number"
+                          step="1"
+                          value={bulkValues.bidOffsetTicks ?? ""}
+                          onChange={(e) =>
+                            setBulkValues({
+                              ...bulkValues,
+                              bidOffsetTicks:
+                                e.target.value === "" ? null : parseInt(e.target.value, 10),
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="bulk-askOffsetTicks">Ask Offset (ticks)</Label>
+                        <Input
+                          id="bulk-askOffsetTicks"
+                          type="number"
+                          step="1"
+                          value={bulkValues.askOffsetTicks ?? ""}
+                          onChange={(e) =>
+                            setBulkValues({
+                              ...bulkValues,
+                              askOffsetTicks:
+                                e.target.value === "" ? null : parseInt(e.target.value, 10),
+                            })
+                          }
+                        />
+                      </div>
+                    </>
+                  ) : (
+                    <div className="grid gap-2">
+                      <Label htmlFor="bulk-targetSpread">Target Spread (¢)</Label>
+                      <Input
+                        id="bulk-targetSpread"
+                        type="number"
+                        step="1"
+                        min="1"
+                        value={(bulkValues.targetSpread * 100).toFixed(0)}
+                        onChange={(e) =>
+                          setBulkValues({
+                            ...bulkValues,
+                            targetSpread: parseFloat(e.target.value) / 100,
+                          })
+                        }
+                      />
+                    </div>
+                  )}
+                  <div className="grid gap-2">
+                    <Label htmlFor="bulk-orderSize">Order Size (shares)</Label>
+                    <Input
+                      id="bulk-orderSize"
+                      type="number"
+                      value={bulkValues.orderSize}
+                      onChange={(e) =>
+                        setBulkValues({
+                          ...bulkValues,
+                          orderSize: parseFloat(e.target.value),
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="grid gap-2">
+                    <Label htmlFor="bulk-maxInventory">Max Inventory (shares)</Label>
+                    <Input
+                      id="bulk-maxInventory"
+                      type="number"
+                      value={bulkValues.maxInventory}
+                      onChange={(e) =>
+                        setBulkValues({
+                          ...bulkValues,
+                          maxInventory: parseFloat(e.target.value),
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="bulk-skewFactor">Skew Factor</Label>
+                    <Input
+                      id="bulk-skewFactor"
+                      type="number"
+                      step="0.001"
+                      value={bulkValues.skewFactor}
+                      onChange={(e) =>
+                        setBulkValues({
+                          ...bulkValues,
+                          skewFactor: parseFloat(e.target.value),
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="bulk-minTimeToResolution">Min Time to Resolution (hrs)</Label>
+                  <Input
+                    id="bulk-minTimeToResolution"
+                    type="number"
+                    value={bulkValues.minTimeToResolution}
+                    onChange={(e) =>
+                      setBulkValues({
+                        ...bulkValues,
+                        minTimeToResolution: parseFloat(e.target.value),
+                      })
+                    }
+                  />
+                </div>
+              </div>
+              <DialogFooter>
+                <Button
+                  variant="outline"
+                  onClick={() => setBulkDialogOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  onClick={() =>
+                    bulkUpdateMM.mutate({
+                      applyToAll: bulkApplyToAll,
+                      ids: selectedMarketIds,
+                      updates: {
+                        targetSpread: bulkValues.targetSpread,
+                        orderSize: bulkValues.orderSize,
+                        maxInventory: bulkValues.maxInventory,
+                        skewFactor: bulkValues.skewFactor,
+                        bidOffsetTicks: bulkValues.useOffsets
+                          ? bulkValues.bidOffsetTicks ?? null
+                          : null,
+                        askOffsetTicks: bulkValues.useOffsets
+                          ? bulkValues.askOffsetTicks ?? null
+                          : null,
+                        minTimeToResolution: bulkValues.minTimeToResolution,
+                      },
+                    })
+                  }
+                  disabled={
+                    bulkUpdateMM.isPending || (!bulkApplyToAll && !hasSelections)
+                  }
+                >
+                  {bulkUpdateMM.isPending ? "Updating..." : "Apply Updates"}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
           <Dialog open={addDialogOpen} onOpenChange={(open) => {
             if (!open) handleCloseDialog();
             else setAddDialogOpen(true);
@@ -475,23 +904,74 @@ export default function MarketMakingPage() {
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="grid gap-2">
-                        <Label htmlFor="targetSpread">Target Spread (¢)</Label>
-                        <Input
-                          id="targetSpread"
-                          type="number"
-                          step="1"
-                          min="1"
-                          value={(formValues.targetSpread * 100).toFixed(0)}
-                          onChange={(e) =>
-                            setFormValues({
-                              ...formValues,
-                              targetSpread: parseFloat(e.target.value) / 100,
-                            })
-                          }
-                        />
+                    <div className="flex items-center justify-between rounded-lg border border-zinc-200 dark:border-zinc-800 p-3">
+                      <div>
+                        <div className="text-sm font-medium">Use Bid/Ask Offsets</div>
+                        <div className="text-xs text-zinc-500">Toggle between offsets and target spread</div>
                       </div>
+                      <Switch
+                        checked={formValues.useOffsets}
+                        onCheckedChange={(checked) =>
+                          setFormValues({ ...formValues, useOffsets: checked })
+                        }
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      {formValues.useOffsets ? (
+                        <>
+                          <div className="grid gap-2">
+                            <Label htmlFor="bidOffsetTicks">Bid Offset (ticks)</Label>
+                            <Input
+                              id="bidOffsetTicks"
+                              type="number"
+                              step="1"
+                              value={formValues.bidOffsetTicks ?? ""}
+                              onChange={(e) =>
+                                setFormValues({
+                                  ...formValues,
+                                  bidOffsetTicks: e.target.value === "" ? null : parseInt(e.target.value, 10),
+                                })
+                              }
+                            />
+                          </div>
+                          <div className="grid gap-2">
+                            <Label htmlFor="askOffsetTicks">Ask Offset (ticks)</Label>
+                            <Input
+                              id="askOffsetTicks"
+                              type="number"
+                              step="1"
+                              value={formValues.askOffsetTicks ?? ""}
+                              onChange={(e) =>
+                                setFormValues({
+                                  ...formValues,
+                                  askOffsetTicks: e.target.value === "" ? null : parseInt(e.target.value, 10),
+                                })
+                              }
+                            />
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="grid gap-2">
+                            <Label htmlFor="targetSpread">Target Spread (¢)</Label>
+                            <Input
+                              id="targetSpread"
+                              type="number"
+                              step="1"
+                              min="1"
+                              value={(formValues.targetSpread * 100).toFixed(0)}
+                              onChange={(e) =>
+                                setFormValues({
+                                  ...formValues,
+                                  targetSpread: parseFloat(e.target.value) / 100,
+                                })
+                              }
+                            />
+                          </div>
+                        </>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
                       <div className="grid gap-2">
                         <Label htmlFor="orderSize">Order Size (shares)</Label>
                         <Input
@@ -506,8 +986,6 @@ export default function MarketMakingPage() {
                           }
                         />
                       </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-4">
                       <div className="grid gap-2">
                         <Label htmlFor="maxInventory">Max Inventory (shares)</Label>
                         <Input
@@ -522,6 +1000,8 @@ export default function MarketMakingPage() {
                           }
                         />
                       </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
                       <div className="grid gap-2">
                         <Label htmlFor="skewFactor">Skew Factor</Label>
                         <Input
@@ -536,27 +1016,6 @@ export default function MarketMakingPage() {
                             })
                           }
                         />
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="grid gap-2">
-                        <Label htmlFor="quotingPolicy">Quoting Policy</Label>
-                        <Select
-                          value={formValues.quotingPolicy}
-                          onValueChange={(value) =>
-                            setFormValues({ ...formValues, quotingPolicy: value })
-                          }
-                        >
-                          <SelectTrigger id="quotingPolicy">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="touch">Touch (at best bid/ask)</SelectItem>
-                            <SelectItem value="inside">Inside (improve by 1 tick)</SelectItem>
-                            <SelectItem value="back">Back (behind best)</SelectItem>
-                            <SelectItem value="defensive">Defensive (inventory-aware)</SelectItem>
-                          </SelectContent>
-                        </Select>
                       </div>
                       <div className="grid gap-2">
                         <Label htmlFor="minTimeToResolution">Min Time to Resolution (hrs)</Label>
@@ -598,100 +1057,195 @@ export default function MarketMakingPage() {
         </div>
       </div>
 
-      {/* Summary Metrics */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-4">
-        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
-          <div className="text-xs text-zinc-500 uppercase">Cash Available</div>
-          <div className="text-2xl font-bold">
-            {summary.cashAvailable !== null
-              ? `$${summary.cashAvailable >= 1000 ? `${(summary.cashAvailable / 1000).toFixed(1)}k` : summary.cashAvailable.toFixed(0)}`
-              : "—"}
+      <Collapsible open={fillsOpen} onOpenChange={setFillsOpen} className="space-y-4">
+        {/* Summary Metrics */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-8 gap-4">
+          <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+            <div className="text-xs text-zinc-500 uppercase">Cash Available</div>
+            <div className="text-2xl font-bold">
+              {summary.cashAvailable !== null
+                ? `$${summary.cashAvailable >= 1000 ? `${(summary.cashAvailable / 1000).toFixed(1)}k` : summary.cashAvailable.toFixed(0)}`
+                : "—"}
+            </div>
           </div>
-        </div>
-        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
-          <div className="text-xs text-zinc-500 uppercase">Net Risk</div>
-          <div className={`text-2xl font-bold ${summary.totalAtRisk > 0 ? "text-amber-600" : ""}`}>
-            ${summary.totalAtRisk >= 1000 ? `${(summary.totalAtRisk / 1000).toFixed(1)}k` : summary.totalAtRisk.toFixed(0)}
+          <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+            <div className="text-xs text-zinc-500 uppercase">Net Risk</div>
+            <div className={`text-2xl font-bold ${summary.totalAtRisk > 0 ? "text-amber-600" : ""}`}>
+              ${summary.totalAtRisk >= 1000 ? `${(summary.totalAtRisk / 1000).toFixed(1)}k` : summary.totalAtRisk.toFixed(0)}
+            </div>
+            <div className="text-xs text-zinc-500 mt-1">
+              {summary.marketsAtRisk > 0 && `${summary.marketsAtRisk} near max inv`}
+            </div>
           </div>
-          <div className="text-xs text-zinc-500 mt-1">
-            {summary.marketsAtRisk > 0 && `${summary.marketsAtRisk} near max inv`}
+          <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+            <div className="text-xs text-zinc-500 uppercase">Capital Deployed</div>
+            <div className="text-2xl font-bold">
+              ${totalDeployed >= 1000 ? `${(totalDeployed / 1000).toFixed(1)}k` : totalDeployed.toFixed(0)}
+            </div>
           </div>
-        </div>
-        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
-          <div className="text-xs text-zinc-500 uppercase">Capital Deployed</div>
-          <div className="text-2xl font-bold">
-            ${totalDeployed >= 1000 ? `${(totalDeployed / 1000).toFixed(1)}k` : totalDeployed.toFixed(0)}
+          <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+            <div className="text-xs text-zinc-500 uppercase">
+              {pnlWindow === "all" ? "Total P&L" : `${pnlWindowLabel} P&L`}
+            </div>
+            <div
+              className={`text-2xl font-bold flex items-center gap-1 ${
+                windowPnlTotal >= 0 ? "text-green-600" : "text-red-600"
+              }`}
+            >
+              {windowPnlTotal >= 0 ? (
+                <TrendingUp className="h-5 w-5" />
+              ) : (
+                <TrendingDown className="h-5 w-5" />
+              )}
+              ${Math.abs(windowPnlTotal).toFixed(2)}
+            </div>
+            <div className="text-xs text-zinc-500 mt-1">
+              {pnlWindow === "all" ? (
+                <>
+                  <span className={summary.totalRealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
+                    ${summary.totalRealizedPnl >= 0 ? "+" : ""}{summary.totalRealizedPnl.toFixed(2)} real
+                  </span>
+                  {" / "}
+                  <span className={summary.totalUnrealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
+                    ${summary.totalUnrealizedPnl >= 0 ? "+" : ""}{summary.totalUnrealizedPnl.toFixed(2)} unreal
+                  </span>
+                </>
+              ) : (
+                <span className={windowPnlTotal >= 0 ? "text-green-600/70" : "text-red-600/70"}>
+                  ${windowPnlTotal >= 0 ? "+" : ""}{windowPnlTotal.toFixed(2)} realized
+                </span>
+              )}
+            </div>
           </div>
-        </div>
-        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
-          <div className="text-xs text-zinc-500 uppercase">Total P&L</div>
-          <div
-            className={`text-2xl font-bold flex items-center gap-1 ${
-              summary.totalPnl >= 0 ? "text-green-600" : "text-red-600"
-            }`}
-          >
-            {summary.totalPnl >= 0 ? (
-              <TrendingUp className="h-5 w-5" />
-            ) : (
-              <TrendingDown className="h-5 w-5" />
-            )}
-            ${Math.abs(summary.totalPnl).toFixed(2)}
+          <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+            <div className="text-xs text-zinc-500 uppercase">Active Makers</div>
+            <div className="text-2xl font-bold">{summary.active}</div>
           </div>
-          <div className="text-xs text-zinc-500 mt-1">
-            <span className={summary.totalRealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
-              ${summary.totalRealizedPnl >= 0 ? "+" : ""}{summary.totalRealizedPnl.toFixed(2)} real
-            </span>
-            {" / "}
-            <span className={summary.totalUnrealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
-              ${summary.totalUnrealizedPnl >= 0 ? "+" : ""}{summary.totalUnrealizedPnl.toFixed(2)} unreal
-            </span>
+          <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+            <div className="text-xs text-zinc-500 uppercase">Open Orders</div>
+            <div className="text-2xl font-bold">{summary.totalOpenOrders}</div>
           </div>
-        </div>
-        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
-          <div className="text-xs text-zinc-500 uppercase">Active Makers</div>
-          <div className="text-2xl font-bold">{summary.active}</div>
-        </div>
-        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
-          <div className="text-xs text-zinc-500 uppercase">Open Orders</div>
-          <div className="text-2xl font-bold">{summary.totalOpenOrders}</div>
-        </div>
-        <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
-          <div className="text-xs text-zinc-500 uppercase">Status</div>
-          <div className="text-2xl font-bold">
-            <Badge variant={mmEnabled ? "default" : "secondary"}>
-              {mmEnabled ? "Running" : "Stopped"}
-            </Badge>
+          <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
+            <div className="text-xs text-zinc-500 uppercase">Status</div>
+            <div className="text-2xl font-bold">
+              <Badge variant={mmEnabled ? "default" : "secondary"}>
+                {mmEnabled ? "Running" : "Stopped"}
+              </Badge>
+            </div>
           </div>
+          <CollapsibleTrigger asChild>
+            <button
+              type="button"
+              className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg text-left transition hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="text-xs text-zinc-500 uppercase">Ask Fills</div>
+                  <div className="text-2xl font-bold">{fillsCountLabel}</div>
+                </div>
+                <ChevronRight
+                  className={`h-4 w-4 text-zinc-500 transition-transform ${fillsOpen ? "rotate-90" : ""}`}
+                />
+              </div>
+              <div className="text-xs text-zinc-500 mt-1">Last 24h</div>
+            </button>
+          </CollapsibleTrigger>
         </div>
-      </div>
 
-      {/* Data Integrity Status */}
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-        <div className="lg:col-span-3">
-          {/* Market Makers Table */}
-          <div className="border rounded-lg overflow-hidden">
+        <CollapsibleContent>
+          <div className="border rounded-lg overflow-hidden bg-zinc-100 dark:bg-zinc-900">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-200 dark:border-zinc-800">
+              <div className="text-sm font-medium">Ask Fill History (24h)</div>
+              <div className="text-xs text-zinc-500">{fillsCountLabel} total</div>
+            </div>
+            <div className="p-4">
+              {fillsLoading ? (
+                <div className="text-sm text-zinc-500">Loading ask fills...</div>
+              ) : fillsAll.length === 0 ? (
+                <div className="text-sm text-zinc-500">No ask fills in the last 24h.</div>
+              ) : (
+                <ScrollArea className="h-64">
+                  <Table>
+                    <TableHeader>
+                      <TableRow className="bg-zinc-50 dark:bg-zinc-900">
+                        <TableHead>Time</TableHead>
+                        <TableHead>Market</TableHead>
+                        <TableHead>Side</TableHead>
+                        <TableHead className="text-right">Size</TableHead>
+                        <TableHead className="text-right">Price</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {fillsAll.map((fill) => (
+                        <TableRow key={fill.id}>
+                          <TableCell className="text-sm text-zinc-600">
+                            {formatDistanceToNow(new Date(fill.filledAt), { addSuffix: true })}
+                          </TableCell>
+                          <TableCell className="max-w-[320px]">
+                            <div className="text-sm font-medium truncate" title={fill.marketQuestion}>
+                              {fill.marketSlug}
+                            </div>
+                            {fill.marketQuestion && (
+                              <div className="text-xs text-zinc-500 truncate" title={fill.marketQuestion}>
+                                {fill.marketQuestion}
+                              </div>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-sm">
+                            <span className={fill.side === "BUY" ? "text-green-600" : "text-red-600"}>
+                              {fill.side}
+                            </span>
+                            <span className="text-zinc-500"> {fill.outcome}</span>
+                          </TableCell>
+                          <TableCell className="text-right text-sm">
+                            {fill.size.toFixed(2)}
+                          </TableCell>
+                          <TableCell className="text-right text-sm">
+                            {fill.price.toFixed(4)}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </ScrollArea>
+              )}
+            </div>
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+
+      {/* Market Makers Table */}
+      <div className="border rounded-lg overflow-hidden">
             <Table>
               <TableHeader>
                 <TableRow className="bg-zinc-50 dark:bg-zinc-900">
+                  <TableHead className="w-[40px]">
+                    <Checkbox
+                      checked={allSelected}
+                      onCheckedChange={(checked) => toggleSelectAll(checked === true)}
+                      aria-label="Select all markets"
+                    />
+                  </TableHead>
                   <TableHead className="w-[220px]">Market</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="text-right">YES Bid</TableHead>
-              <TableHead className="text-right">YES Ask</TableHead>
-              <TableHead className="text-right">NO Bid</TableHead>
-              <TableHead className="text-right">NO Ask</TableHead>
-              <TableHead className="text-right">YES Inv</TableHead>
-              <TableHead className="text-right">NO Inv</TableHead>
-              <TableHead className="text-right">Deployed</TableHead>
-              <TableHead className="text-right">P&L</TableHead>
-              <TableHead className="text-right">Fills</TableHead>
-              <TableHead className="text-right">Actions</TableHead>
+                  <TableHead className="text-right">YES Ask</TableHead>
+                  <TableHead className="text-right">YES Inv</TableHead>
+                  <TableHead className="text-right">NO Bid</TableHead>
+                  <TableHead className="text-right">NO Ask</TableHead>
+                  <TableHead className="text-right">NO Inv</TableHead>
+                  <TableHead className="text-right">Deployed</TableHead>
+                  <TableHead className="text-right">P&L</TableHead>
+                  <TableHead className="text-right">{pnlWindowLabel} P&L</TableHead>
+                  <TableHead className="text-right">Fills</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {isLoading ? (
               Array.from({ length: 3 }).map((_, i) => (
                 <TableRow key={i}>
-                  <TableCell colSpan={12}>
+                  <TableCell colSpan={14}>
                     <Skeleton className="h-4 w-full" />
                   </TableCell>
                 </TableRow>
@@ -699,7 +1253,7 @@ export default function MarketMakingPage() {
             ) : marketMakers.length === 0 ? (
               <TableRow>
                 <TableCell
-                  colSpan={12}
+                  colSpan={14}
                   className="text-center py-12 text-zinc-500"
                 >
                   <BarChart3 className="h-12 w-12 mx-auto mb-2 opacity-20" />
@@ -708,19 +1262,43 @@ export default function MarketMakingPage() {
                 </TableCell>
               </TableRow>
             ) : (
-              marketMakers.map((mm) => {
+              sortedMarketMakers.map((mm) => {
                 const yesBid = getOrder(mm, "YES", "BID");
                 const yesAsk = getOrder(mm, "YES", "ASK");
                 const noBid = getOrder(mm, "NO", "BID");
                 const noAsk = getOrder(mm, "NO", "ASK");
                 const volatilityPaused = isVolatilityPaused(mm);
                 const deployed = mm.yesInventory * mm.avgYesCost + mm.noInventory * mm.avgNoCost;
+                const windowPnl = getWindowPnl(mm);
+                const yesInventoryMagnitude = Math.abs(mm.yesInventory);
+                const noInventoryMagnitude = Math.abs(mm.noInventory);
+                const hasYesInventory = yesInventoryMagnitude > 0.0001;
+                const hasNoInventory = noInventoryMagnitude > 0.0001;
+                const yesPriceClass =
+                  hasYesInventory && yesInventoryMagnitude >= 1
+                    ? "text-green-600"
+                    : "text-zinc-500";
+                const noPriceClass =
+                  hasNoInventory && noInventoryMagnitude >= 1
+                    ? "text-red-600"
+                    : "text-zinc-500";
+
+                const staleClass = getStaleRowClass(mm);
 
                 return (
                   <TableRow
                     key={mm.id}
-                    className={mm.paused || volatilityPaused ? "opacity-50" : ""}
+                    className={`${mm.paused || volatilityPaused ? "opacity-50" : ""} ${staleClass}`}
                   >
+                    <TableCell>
+                      <Checkbox
+                        checked={selectedMarketIdSet.has(mm.id)}
+                        onCheckedChange={(checked) =>
+                          toggleMarketSelection(mm.id, checked === true)
+                        }
+                        aria-label={`Select ${mm.market?.slug ?? mm.id}`}
+                      />
+                    </TableCell>
                     <TableCell className="font-medium">
                       <div>
                         <a
@@ -735,7 +1313,11 @@ export default function MarketMakingPage() {
                         <div className="text-xs text-zinc-500 flex items-center gap-1">
                           {mm.market?.category || "—"}
                           <span className="text-zinc-400">·</span>
-                          <span>{mm.quotingPolicy}</span>
+                          <span>
+                            {mm.bidOffsetTicks !== null || mm.askOffsetTicks !== null
+                              ? `Bid -${mm.bidOffsetTicks ?? 0}t / Ask +${mm.askOffsetTicks ?? 0}t`
+                              : `Spread ${(mm.targetSpread * 100).toFixed(0)}¢`}
+                          </span>
                         </div>
                         <div className="text-xs text-zinc-500 flex items-center gap-2">
                           <span>
@@ -745,11 +1327,11 @@ export default function MarketMakingPage() {
                           </span>
                           <span className="text-zinc-400">·</span>
                           <span>
-                            Yes {mm.market?.yesPrice != null ? `$${mm.market.yesPrice.toFixed(2)}` : "—"}
+                            Yes {mm.market?.yesBestBid != null ? `$${mm.market.yesBestBid.toFixed(2)}` : "—"}
                           </span>
                           <span>/</span>
                           <span>
-                            No {mm.market?.noPrice != null ? `$${mm.market.noPrice.toFixed(2)}` : "—"}
+                            No {mm.market?.noBestBid != null ? `$${mm.market.noBestBid.toFixed(2)}` : "—"}
                           </span>
                         </div>
                       </div>
@@ -786,6 +1368,14 @@ export default function MarketMakingPage() {
                         </div>
                       ) : "—"}
                     </TableCell>
+                    <TableCell className="text-right font-mono">
+                      <span className={yesPriceClass}>
+                        {hasYesInventory && mm.avgYesCost > 0 ? `$${mm.avgYesCost.toFixed(2)}` : "-"}
+                      </span>
+                      {hasYesInventory && (
+                        <div className="text-xs text-zinc-500">{mm.yesInventory.toFixed(1)}</div>
+                      )}
+                    </TableCell>
                     <TableCell className="text-right font-mono text-green-600">
                       {noBid ? (
                         <div>
@@ -803,19 +1393,11 @@ export default function MarketMakingPage() {
                       ) : "—"}
                     </TableCell>
                     <TableCell className="text-right font-mono">
-                      <span className="text-green-600">{mm.yesInventory.toFixed(1)}</span>
-                      {mm.avgYesCost > 0 && (
-                        <div className="text-xs text-zinc-500">
-                          @${mm.avgYesCost.toFixed(2)}
-                        </div>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-right font-mono">
-                      <span className="text-red-600">{mm.noInventory.toFixed(1)}</span>
-                      {mm.avgNoCost > 0 && (
-                        <div className="text-xs text-zinc-500">
-                          @${mm.avgNoCost.toFixed(2)}
-                        </div>
+                      <span className={noPriceClass}>
+                        {hasNoInventory && mm.avgNoCost > 0 ? `$${mm.avgNoCost.toFixed(2)}` : "-"}
+                      </span>
+                      {hasNoInventory && (
+                        <div className="text-xs text-zinc-500">{mm.noInventory.toFixed(1)}</div>
                       )}
                     </TableCell>
                     <TableCell className="text-right font-mono">
@@ -843,8 +1425,23 @@ export default function MarketMakingPage() {
                           : "—"}
                       </div>
                     </TableCell>
+                    <TableCell
+                      className={`text-right font-mono ${
+                        windowPnl >= 0 ? "text-green-600" : "text-red-600"
+                      }`}
+                    >
+                      <div className="font-bold">${windowPnl.toFixed(2)}</div>
+                      <div className="text-xs opacity-70">realized</div>
+                    </TableCell>
                     <TableCell className="text-right text-sm">
-                      {mm.fillCount}
+                      <div>{mm.fillCount}</div>
+                      <div className="text-xs text-zinc-500">
+                        {mm.lastFillAt ? (
+                          formatDistanceToNow(new Date(mm.lastFillAt), { addSuffix: true })
+                        ) : mm.orders.length > 0 ? (
+                          `bidding ${formatDistanceToNow(new Date(mm.createdAt))}`
+                        ) : null}
+                      </div>
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
@@ -868,11 +1465,15 @@ export default function MarketMakingPage() {
                           onClick={() => {
                             setEditingMM(mm);
                             setFormValues({
+                              useOffsets:
+                                mm.bidOffsetTicks !== null ||
+                                mm.askOffsetTicks !== null,
                               targetSpread: mm.targetSpread,
                               orderSize: mm.orderSize,
                               maxInventory: mm.maxInventory,
                               skewFactor: mm.skewFactor,
-                              quotingPolicy: mm.quotingPolicy,
+                              bidOffsetTicks: mm.bidOffsetTicks ?? 1,
+                              askOffsetTicks: mm.askOffsetTicks ?? 0,
                               minTimeToResolution: mm.minTimeToResolution,
                             });
                           }}
@@ -905,13 +1506,6 @@ export default function MarketMakingPage() {
             )}
           </TableBody>
         </Table>
-          </div>
-        </div>
-
-        {/* Sync Status Sidebar */}
-        <div className="lg:col-span-1">
-          <SyncStatus />
-        </div>
       </div>
 
       {/* Edit Dialog */}
@@ -924,23 +1518,72 @@ export default function MarketMakingPage() {
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-4 py-4">
-            <div className="grid grid-cols-2 gap-4">
-              <div className="grid gap-2">
-                <Label htmlFor="edit-targetSpread">Target Spread (¢)</Label>
-                <Input
-                  id="edit-targetSpread"
-                  type="number"
-                  step="1"
-                  min="1"
-                  value={(formValues.targetSpread * 100).toFixed(0)}
-                  onChange={(e) =>
-                    setFormValues({
-                      ...formValues,
-                      targetSpread: parseFloat(e.target.value) / 100,
-                    })
-                  }
-                />
+            <div className="flex items-center justify-between rounded-lg border border-zinc-200 dark:border-zinc-800 p-3">
+              <div>
+                <div className="text-sm font-medium">Use Bid/Ask Offsets</div>
+                <div className="text-xs text-zinc-500">Toggle between offsets and target spread</div>
               </div>
+              <Switch
+                checked={formValues.useOffsets}
+                onCheckedChange={(checked) =>
+                  setFormValues({ ...formValues, useOffsets: checked })
+                }
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              {formValues.useOffsets ? (
+                <>
+                  <div className="grid gap-2">
+                    <Label htmlFor="edit-bidOffsetTicks">Bid Offset (ticks)</Label>
+                    <Input
+                      id="edit-bidOffsetTicks"
+                      type="number"
+                      step="1"
+                      value={formValues.bidOffsetTicks ?? ""}
+                      onChange={(e) =>
+                        setFormValues({
+                          ...formValues,
+                          bidOffsetTicks: e.target.value === "" ? null : parseInt(e.target.value, 10),
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="edit-askOffsetTicks">Ask Offset (ticks)</Label>
+                    <Input
+                      id="edit-askOffsetTicks"
+                      type="number"
+                      step="1"
+                      value={formValues.askOffsetTicks ?? ""}
+                      onChange={(e) =>
+                        setFormValues({
+                          ...formValues,
+                          askOffsetTicks: e.target.value === "" ? null : parseInt(e.target.value, 10),
+                        })
+                      }
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="grid gap-2">
+                    <Label htmlFor="edit-targetSpread">Target Spread (¢)</Label>
+                    <Input
+                      id="edit-targetSpread"
+                      type="number"
+                      step="1"
+                      min="1"
+                      value={(formValues.targetSpread * 100).toFixed(0)}
+                      onChange={(e) =>
+                        setFormValues({
+                          ...formValues,
+                          targetSpread: parseFloat(e.target.value) / 100,
+                        })
+                      }
+                    />
+                  </div>
+                </>
+              )}
               <div className="grid gap-2">
                 <Label htmlFor="edit-orderSize">Order Size (shares)</Label>
                 <Input
@@ -988,25 +1631,6 @@ export default function MarketMakingPage() {
               </div>
             </div>
             <div className="grid grid-cols-2 gap-4">
-              <div className="grid gap-2">
-                <Label htmlFor="edit-quotingPolicy">Quoting Policy</Label>
-                <Select
-                  value={formValues.quotingPolicy}
-                  onValueChange={(value) =>
-                    setFormValues({ ...formValues, quotingPolicy: value })
-                  }
-                >
-                  <SelectTrigger id="edit-quotingPolicy">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="touch">Touch (at best bid/ask)</SelectItem>
-                    <SelectItem value="inside">Inside (improve by 1 tick)</SelectItem>
-                    <SelectItem value="back">Back (behind best)</SelectItem>
-                    <SelectItem value="defensive">Defensive (inventory-aware)</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
               <div className="grid gap-2">
                 <Label htmlFor="edit-minTimeToResolution">Min Time to Resolution (hrs)</Label>
                 <Input

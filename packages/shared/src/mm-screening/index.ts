@@ -34,6 +34,11 @@ export interface CLOBPricing {
   spread: number | null;    // From /spread endpoint (in decimal, e.g., 0.01)
 }
 
+export interface CLOBPricingPair {
+  yes: CLOBPricing;
+  no?: CLOBPricing;
+}
+
 export interface MMScreeningParams {
   // Time filters
   minTimeToEndHours: number; // Exclude if < this (default: 48)
@@ -49,12 +54,27 @@ export interface MMScreeningParams {
 
   // Volume filters
   minVolume24h: number; // Min 24h volume (default: 10000)
+  flowVolumeTarget: number; // Volume to reach max flow score (default: 250k)
+
+  // Queue metrics (small MM focus)
+  assumedOrderSize: number; // Assumed order size for queue depth ratio (default: 100)
+  minQueueSpeed: number; // Minimum turnover ratio to score > 0 (default: 1)
+  maxQueueSpeed: number; // Turnover ratio to reach max score (default: 25)
+  idealQueueDepthRatio: number; // Ideal top-depth/size ratio (default: 10)
+  maxQueueDepthRatio: number; // Disqualify if ratio exceeds this (default: 200)
+
+  // Data quality
+  requireBothBooks: boolean; // Require YES and NO books (default: true)
+  disqualifyAmbiguous: boolean; // Disqualify ambiguous resolution (default: true)
 
   // Price zone filters
   excludeMidLt: number; // Exclude if mid < this (default: 0.10)
   excludeMidGt: number; // Exclude if mid > this (default: 0.90)
   preferredMidMin: number; // Preferred zone start (default: 0.20)
   preferredMidMax: number; // Preferred zone end (default: 0.80)
+
+  // Tick size override (optional, defaults to 0.01)
+  tickSize?: number;
 }
 
 export interface MMScreeningResult {
@@ -74,6 +94,8 @@ export interface MMScreeningResult {
   depth3cTotal: number;
   bookSlope: number;
   volume24h: number;
+  queueSpeed: number;
+  queueDepthRatio: number;
   hoursToEnd: number | null;
 
   // Scores (0-100)
@@ -81,6 +103,8 @@ export interface MMScreeningResult {
   flowScore: number;
   timeScore: number;
   priceZoneScore: number;
+  queueSpeedScore: number;
+  queueDepthScore: number;
   totalScore: number;
 
   // Risk flags
@@ -101,16 +125,24 @@ export const DEFAULT_MM_SCREENING_PARAMS: MMScreeningParams = {
   minTimeToEndHours: 24,
   preferredTimeToEndMinDays: 3,
   preferredTimeToEndMaxDays: 120,
-  maxSpreadTicks: 5, // 5 ticks = $0.05 max spread (more realistic for crypto markets)
-  minTopDepthNotional: 100, // $100 at top of book
-  minDepthWithin3cNotional: 500, // $500 within ±3¢
-  minDepthEachSideWithin3c: 100, // $100 each side within ±3¢
-  minBookSlope: 0.05, // More lenient slope requirement
-  minVolume24h: 1000, // Lower volume threshold
-  excludeMidLt: 0.05, // Exclude < 5% implied prob
-  excludeMidGt: 0.95, // Exclude > 95% implied prob
-  preferredMidMin: 0.15, // Preferred 15-85%
-  preferredMidMax: 0.85,
+  maxSpreadTicks: 4, // 4 ticks = $0.04 max spread for small MM
+  minTopDepthNotional: 250, // $250 at top of book
+  minDepthWithin3cNotional: 1500, // $1500 within ±3¢
+  minDepthEachSideWithin3c: 500, // $500 each side within ±3¢
+  minBookSlope: 0.1, // Require some concentration
+  minVolume24h: 25000, // Focus on higher flow markets
+  flowVolumeTarget: 250000, // Volume to reach max flow score
+  assumedOrderSize: 100,
+  minQueueSpeed: 1, // 1x daily turnover vs depth
+  maxQueueSpeed: 25, // 25x daily turnover caps the score
+  idealQueueDepthRatio: 10, // 10 orders deep is ideal
+  maxQueueDepthRatio: 200, // Disqualify if too deep
+  requireBothBooks: true,
+  disqualifyAmbiguous: true,
+  excludeMidLt: 0.1, // Exclude < 10% implied prob
+  excludeMidGt: 0.9, // Exclude > 90% implied prob
+  preferredMidMin: 0.2, // Preferred 20-80%
+  preferredMidMax: 0.8,
 };
 
 // Keywords that indicate ambiguous resolution
@@ -151,11 +183,11 @@ export function calculateMidPriceFromBook(book: OrderBook): number | null {
 /**
  * Calculate spread in ticks
  */
-export function calculateSpreadTicks(book: OrderBook): number | null {
+export function calculateSpreadTicks(book: OrderBook, tickSize: number = MM_TICK_SIZE): number | null {
   if (book.bids.length === 0 || book.asks.length === 0) return null;
   const bestBid = book.bids[0].price;
   const bestAsk = book.asks[0].price;
-  return Math.round((bestAsk - bestBid) / MM_TICK_SIZE);
+  return Math.round((bestAsk - bestBid) / tickSize);
 }
 
 /**
@@ -206,6 +238,46 @@ export function calculateBookSlope(book: OrderBook, midPrice: number): number {
 
   if (depth5c === 0) return 0;
   return depth1c / depth5c;
+}
+
+export interface BookMetrics {
+  midPrice: number | null;
+  spreadTicks: number | null;
+  topDepthNotional: number;
+  depth3cBid: number;
+  depth3cAsk: number;
+  depth3cTotal: number;
+  bookSlope: number;
+}
+
+export function analyzeOrderBook(
+  book: OrderBook,
+  pricing?: CLOBPricing,
+  tickSize: number = MM_TICK_SIZE
+): BookMetrics {
+  const midPrice =
+    pricing?.midpoint !== null && pricing?.midpoint !== undefined
+      ? pricing.midpoint
+      : calculateMidPriceFromBook(book);
+
+  const spreadTicks =
+    pricing?.spread !== null && pricing?.spread !== undefined
+      ? Math.round(pricing.spread / tickSize)
+      : calculateSpreadTicks(book, tickSize);
+
+  const topDepthNotional = calculateTopDepth(book);
+  const depth3c = midPrice === null ? { bidDepth: 0, askDepth: 0, total: 0 } : calculateDepthWithinRange(book, midPrice, 3);
+  const bookSlope = midPrice === null ? 0 : calculateBookSlope(book, midPrice);
+
+  return {
+    midPrice,
+    spreadTicks,
+    topDepthNotional,
+    depth3cBid: depth3c.bidDepth,
+    depth3cAsk: depth3c.askDepth,
+    depth3cTotal: depth3c.total,
+    bookSlope,
+  };
 }
 
 // ============================================================================
@@ -272,29 +344,29 @@ export function calculateLiquidityScore(
 ): number {
   let score = 0;
 
-  // Spread score (0-30): 1 tick = 30, 2 ticks = 20, 3+ = 0
-  if (spreadTicks === 1) score += 30;
-  else if (spreadTicks === 2) score += 20;
-  else if (spreadTicks === 3) score += 5;
+  // Spread score (0-30): prefer 2-3 ticks for small MM
+  if (spreadTicks === 2) score += 30;
+  else if (spreadTicks === 3) score += 20;
+  else if (spreadTicks === 1) score += 10;
 
-  // Top depth score (0-25): scale from min to 2x min
-  const topDepthScore = Math.min(25, (topDepth / params.minTopDepthNotional) * 12.5);
+  // Top depth score (0-10): scale from min to 2x min
+  const topDepthScore = Math.min(10, (topDepth / params.minTopDepthNotional) * 5);
   score += topDepthScore;
 
   // Depth within 3c score (0-30): scale from min to 2x min
   const depth3cScore = Math.min(30, (depth3cTotal / params.minDepthWithin3cNotional) * 15);
   score += depth3cScore;
 
-  // Balance score (0-10): both sides should have decent depth
+  // Balance score (0-20): both sides should have decent depth
   const minSide = Math.min(depth3cBid, depth3cAsk);
   const maxSide = Math.max(depth3cBid, depth3cAsk);
   const balance = maxSide > 0 ? minSide / maxSide : 0;
-  score += balance * 10;
+  score += balance * 20;
 
-  // Book slope score (0-5): reward concentrated liquidity
-  if (bookSlope >= 0.3) score += 5;
-  else if (bookSlope >= 0.2) score += 3;
-  else if (bookSlope >= 0.15) score += 1;
+  // Book slope score (0-10): reward concentrated liquidity
+  if (bookSlope >= 0.3) score += 10;
+  else if (bookSlope >= 0.2) score += 6;
+  else if (bookSlope >= 0.15) score += 3;
 
   return Math.min(100, Math.round(score));
 }
@@ -304,11 +376,52 @@ export function calculateLiquidityScore(
  * Based on: 24h volume
  */
 export function calculateFlowScore(volume24h: number, params: MMScreeningParams): number {
-  // Scale: min = 0, 50k = 50, 100k+ = 100
   if (volume24h < params.minVolume24h) return 0;
 
-  const score = Math.min(100, (volume24h / 100000) * 100);
-  return Math.round(score);
+  const minVol = Math.max(params.minVolume24h, 1);
+  const maxVol = Math.max(params.flowVolumeTarget, minVol * 2);
+  const logMin = Math.log10(minVol);
+  const logMax = Math.log10(maxVol);
+  const logVal = Math.log10(Math.max(volume24h, minVol));
+
+  const normalized = (logVal - logMin) / (logMax - logMin);
+  return Math.max(0, Math.min(100, Math.round(normalized * 100)));
+}
+
+/**
+ * Calculate queue speed score (0-100)
+ * Based on: volume24h / depth3cTotal (turnover)
+ */
+export function calculateQueueSpeedScore(queueSpeed: number, params: MMScreeningParams): number {
+  const minSpeed = Math.max(params.minQueueSpeed, 0.0001);
+  const maxSpeed = Math.max(params.maxQueueSpeed, minSpeed * 2);
+
+  if (queueSpeed <= minSpeed) return 0;
+  if (queueSpeed >= maxSpeed) return 100;
+
+  const logMin = Math.log10(minSpeed);
+  const logMax = Math.log10(maxSpeed);
+  const logVal = Math.log10(queueSpeed);
+  const normalized = (logVal - logMin) / (logMax - logMin);
+  return Math.max(0, Math.min(100, Math.round(normalized * 100)));
+}
+
+/**
+ * Calculate queue depth score (0-100)
+ * Based on: topDepthShares / assumedOrderSize (lower is better)
+ */
+export function calculateQueueDepthScore(queueDepthRatio: number, params: MMScreeningParams): number {
+  const ideal = Math.max(params.idealQueueDepthRatio, 1);
+  const maxRatio = Math.max(params.maxQueueDepthRatio, ideal * 2);
+
+  if (queueDepthRatio <= ideal) return 100;
+  if (queueDepthRatio >= maxRatio) return 0;
+
+  const logIdeal = Math.log10(ideal);
+  const logMax = Math.log10(maxRatio);
+  const logVal = Math.log10(queueDepthRatio);
+  const normalized = (logVal - logIdeal) / (logMax - logIdeal);
+  return Math.max(0, Math.min(100, Math.round((1 - normalized) * 100)));
 }
 
 /**
@@ -375,50 +488,36 @@ export interface MarketData {
   yesPrice: number | null;
   volume24h: number;
   outcomes?: string | string[];
+  tickSize?: number;
 }
 
 /**
  * Screen a market for MM viability
  *
  * @param market - Market data from database
- * @param book - Order book data (used for depth analysis)
+ * @param yesBook - YES order book data (used for depth analysis)
  * @param params - Screening parameters
  * @param clobPricing - Optional pricing from CLOB /midpoint and /spread endpoints
  *                      If provided, these are used instead of calculating from book
+ * @param noBook - Optional NO order book data (used for depth analysis)
  */
 export function screenMarketForMM(
   market: MarketData,
-  book: OrderBook,
+  yesBook: OrderBook,
   params: MMScreeningParams = DEFAULT_MM_SCREENING_PARAMS,
-  clobPricing?: CLOBPricing
+  clobPricing?: CLOBPricingPair,
+  noBook?: OrderBook
 ): MMScreeningResult {
+  const tickSize = market.tickSize ?? params.tickSize ?? MM_TICK_SIZE;
   const flags: string[] = [];
   const disqualifyReasons: string[] = [];
 
-  // Calculate basic metrics
-  // Prefer CLOB pricing endpoints (more accurate) over raw book calculation
-  let midPrice: number | null;
-  let spreadTicks: number | null;
-
-  if (clobPricing?.midpoint !== null && clobPricing?.midpoint !== undefined) {
-    // Use CLOB /midpoint endpoint (more accurate)
-    midPrice = clobPricing.midpoint;
-  } else {
-    // Fallback to book calculation
-    midPrice = calculateMidPriceFromBook(book);
-  }
-
-  if (clobPricing?.spread !== null && clobPricing?.spread !== undefined) {
-    // Use CLOB /spread endpoint (more accurate)
-    // Convert decimal spread to ticks
-    spreadTicks = Math.round(clobPricing.spread / MM_TICK_SIZE);
-  } else {
-    // Fallback to book calculation
-    spreadTicks = calculateSpreadTicks(book);
-  }
+  const yesMetrics = analyzeOrderBook(yesBook, clobPricing?.yes, tickSize);
+  const noMetrics = noBook ? analyzeOrderBook(noBook, clobPricing?.no, tickSize) : null;
+  const hasNoBook = Boolean(noMetrics && noMetrics.midPrice !== null && noMetrics.spreadTicks !== null);
 
   // Handle missing data
-  if (midPrice === null || spreadTicks === null) {
+  if (yesMetrics.midPrice === null || yesMetrics.spreadTicks === null) {
     return {
       marketId: market.id,
       slug: market.slug,
@@ -434,11 +533,15 @@ export function screenMarketForMM(
       depth3cTotal: 0,
       bookSlope: 0,
       volume24h: market.volume24h,
+      queueSpeed: 0,
+      queueDepthRatio: 0,
       hoursToEnd: null,
       liquidityScore: 0,
       flowScore: 0,
       timeScore: 0,
       priceZoneScore: 0,
+      queueSpeedScore: 0,
+      queueDepthScore: 0,
       totalScore: 0,
       flags: ["No liquidity"],
       eligible: false,
@@ -446,10 +549,42 @@ export function screenMarketForMM(
     };
   }
 
-  const spreadPercent = (spreadTicks * MM_TICK_SIZE) / midPrice;
-  const topDepth = calculateTopDepth(book);
-  const depth3c = calculateDepthWithinRange(book, midPrice, 3);
-  const bookSlope = calculateBookSlope(book, midPrice);
+  if (params.requireBothBooks && !hasNoBook) {
+    disqualifyReasons.push("Missing NO order book");
+    flags.push("NO book missing");
+  }
+
+  const midPrice = yesMetrics.midPrice;
+  const spreadTicks = hasNoBook
+    ? Math.max(yesMetrics.spreadTicks, noMetrics!.spreadTicks!)
+    : yesMetrics.spreadTicks;
+  const spreadPercent = (spreadTicks * tickSize) / midPrice;
+  const topDepth = hasNoBook
+    ? Math.min(yesMetrics.topDepthNotional, noMetrics!.topDepthNotional)
+    : yesMetrics.topDepthNotional;
+  const depth3cTotal = hasNoBook
+    ? Math.min(yesMetrics.depth3cTotal, noMetrics!.depth3cTotal)
+    : yesMetrics.depth3cTotal;
+  const depth3cBid = hasNoBook
+    ? Math.min(yesMetrics.depth3cBid, noMetrics!.depth3cBid)
+    : yesMetrics.depth3cBid;
+  const depth3cAsk = hasNoBook
+    ? Math.min(yesMetrics.depth3cAsk, noMetrics!.depth3cAsk)
+    : yesMetrics.depth3cAsk;
+  const bookSlope = hasNoBook
+    ? Math.min(yesMetrics.bookSlope, noMetrics!.bookSlope)
+    : yesMetrics.bookSlope;
+
+  const yesTopDepthShares = yesMetrics.midPrice > 0 ? yesMetrics.topDepthNotional / yesMetrics.midPrice : 0;
+  const noTopDepthShares =
+    hasNoBook && noMetrics!.midPrice! > 0 ? noMetrics!.topDepthNotional / noMetrics!.midPrice! : 0;
+  const worstTopDepthShares = hasNoBook ? Math.max(yesTopDepthShares, noTopDepthShares) : yesTopDepthShares;
+  const queueDepthRatio =
+    params.assumedOrderSize > 0 ? worstTopDepthShares / params.assumedOrderSize : 0;
+  const depthForSpeed = hasNoBook
+    ? Math.max(yesMetrics.depth3cTotal, noMetrics!.depth3cTotal)
+    : yesMetrics.depth3cTotal;
+  const queueSpeed = depthForSpeed > 0 ? market.volume24h / depthForSpeed : 0;
 
   // Calculate hours to end
   let hoursToEnd: number | null = null;
@@ -482,19 +617,43 @@ export function screenMarketForMM(
   }
 
   // Depth within 3c too thin
-  if (depth3c.total < params.minDepthWithin3cNotional) {
-    disqualifyReasons.push(`Depth within 3c too thin ($${depth3c.total.toFixed(0)} < $${params.minDepthWithin3cNotional})`);
+  if (depth3cTotal < params.minDepthWithin3cNotional) {
+    disqualifyReasons.push(`Depth within 3c too thin ($${depth3cTotal.toFixed(0)} < $${params.minDepthWithin3cNotional})`);
     flags.push("Shallow book");
   }
 
   // One-sided book
-  if (depth3c.bidDepth < params.minDepthEachSideWithin3c) {
-    disqualifyReasons.push(`Bid side too thin ($${depth3c.bidDepth.toFixed(0)} < $${params.minDepthEachSideWithin3c})`);
+  if (yesMetrics.depth3cBid < params.minDepthEachSideWithin3c) {
+    disqualifyReasons.push(`YES bid too thin ($${yesMetrics.depth3cBid.toFixed(0)} < $${params.minDepthEachSideWithin3c})`);
     flags.push("One-sided (no bids)");
   }
-  if (depth3c.askDepth < params.minDepthEachSideWithin3c) {
-    disqualifyReasons.push(`Ask side too thin ($${depth3c.askDepth.toFixed(0)} < $${params.minDepthEachSideWithin3c})`);
+  if (yesMetrics.depth3cAsk < params.minDepthEachSideWithin3c) {
+    disqualifyReasons.push(`YES ask too thin ($${yesMetrics.depth3cAsk.toFixed(0)} < $${params.minDepthEachSideWithin3c})`);
     flags.push("One-sided (no asks)");
+  }
+  if (hasNoBook) {
+    if (noMetrics!.depth3cBid < params.minDepthEachSideWithin3c) {
+      disqualifyReasons.push(`NO bid too thin ($${noMetrics!.depth3cBid.toFixed(0)} < $${params.minDepthEachSideWithin3c})`);
+      flags.push("One-sided (no bids)");
+    }
+    if (noMetrics!.depth3cAsk < params.minDepthEachSideWithin3c) {
+      disqualifyReasons.push(`NO ask too thin ($${noMetrics!.depth3cAsk.toFixed(0)} < $${params.minDepthEachSideWithin3c})`);
+      flags.push("One-sided (no asks)");
+    }
+  }
+
+  // Queue depth too large
+  if (queueDepthRatio > params.maxQueueDepthRatio) {
+    disqualifyReasons.push(
+      `Queue too deep (${queueDepthRatio.toFixed(0)}x > ${params.maxQueueDepthRatio}x order size)`
+    );
+    flags.push("Deep queue");
+  }
+
+  // Queue speed too slow
+  if (queueSpeed < params.minQueueSpeed) {
+    disqualifyReasons.push(`Queue too slow (${queueSpeed.toFixed(2)} < ${params.minQueueSpeed})`);
+    flags.push("Slow queue");
   }
 
   // Book slope (concentration)
@@ -523,7 +682,9 @@ export function screenMarketForMM(
   const ambiguity = checkResolutionAmbiguity(market.question);
   if (ambiguity.isAmbiguous) {
     flags.push(`Ambiguous (${ambiguity.matchedKeywords.slice(0, 2).join(", ")})`);
-    // Not a hard disqualify, just a flag
+    if (params.disqualifyAmbiguous) {
+      disqualifyReasons.push("Ambiguous resolution");
+    }
   }
 
   // Binary check
@@ -539,23 +700,27 @@ export function screenMarketForMM(
   const liquidityScore = calculateLiquidityScore(
     spreadTicks,
     topDepth,
-    depth3c.total,
-    depth3c.bidDepth,
-    depth3c.askDepth,
+    depth3cTotal,
+    depth3cBid,
+    depth3cAsk,
     bookSlope,
     params
   );
 
+  const queueSpeedScore = calculateQueueSpeedScore(queueSpeed, params);
+  const queueDepthScore = calculateQueueDepthScore(queueDepthRatio, params);
   const flowScore = calculateFlowScore(market.volume24h, params);
   const timeScore = calculateTimeScore(hoursToEnd, params);
   const priceZoneScore = calculatePriceZoneScore(midPrice, params);
 
-  // Weighted total: Liquidity 40%, Flow 25%, Time 10%, Price Zone 25%
+  // Weighted total: Queue Speed 35%, Liquidity 25%, Flow 15%, Time 10%, Price Zone 10%, Queue Depth 5%
   const totalScore = Math.round(
-    liquidityScore * 0.4 +
-    flowScore * 0.25 +
+    queueSpeedScore * 0.35 +
+    liquidityScore * 0.25 +
+    flowScore * 0.15 +
     timeScore * 0.10 +
-    priceZoneScore * 0.25
+    priceZoneScore * 0.10 +
+    queueDepthScore * 0.05
   );
 
   return {
@@ -568,16 +733,20 @@ export function screenMarketForMM(
     spreadTicks,
     spreadPercent,
     topDepthNotional: topDepth,
-    depth3cBid: depth3c.bidDepth,
-    depth3cAsk: depth3c.askDepth,
-    depth3cTotal: depth3c.total,
+    depth3cBid,
+    depth3cAsk,
+    depth3cTotal,
     bookSlope,
     volume24h: market.volume24h,
+    queueSpeed,
+    queueDepthRatio,
     hoursToEnd,
     liquidityScore,
     flowScore,
     timeScore,
     priceZoneScore,
+    queueSpeedScore,
+    queueDepthScore,
     totalScore,
     flags,
     eligible: disqualifyReasons.length === 0,

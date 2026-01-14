@@ -37,7 +37,12 @@ favored/
    - `POLYMARKET_FUNDER_ADDRESS` = your Polymarket profile/proxy wallet (Safe) address
    - Generate API creds with: `npx tsx scripts/generate-api-creds.ts`
 
-2. Start services:
+3. Optional: enable the CLOB user WebSocket listener for realtime fills:
+   - `CLOB_WS_ENABLED=true`
+   - `CLOB_WS_HOST=wss://ws-subscriptions-clob.polymarket.com/ws/user`
+   - `CLOB_WS_PING_INTERVAL_MS=5000`
+
+4. Start services:
    ```bash
    docker-compose up -d
    ```

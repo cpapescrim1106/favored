@@ -74,6 +74,8 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       maxInventory: Number(marketMaker.maxInventory),
       skewFactor: Number(marketMaker.skewFactor),
       quotingPolicy: marketMaker.quotingPolicy,
+      bidOffsetTicks: marketMaker.bidOffsetTicks ?? null,
+      askOffsetTicks: marketMaker.askOffsetTicks ?? null,
       yesInventory: Number(marketMaker.yesInventory),
       noInventory: Number(marketMaker.noInventory),
       avgYesCost: Number(marketMaker.avgYesCost),
@@ -127,7 +129,8 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
       orderSize,
       maxInventory,
       skewFactor,
-      quotingPolicy,
+      bidOffsetTicks,
+      askOffsetTicks,
       minTimeToResolution,
       paused,
       active,
@@ -140,7 +143,15 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
     if (orderSize !== undefined) updateData.orderSize = orderSize;
     if (maxInventory !== undefined) updateData.maxInventory = maxInventory;
     if (skewFactor !== undefined) updateData.skewFactor = skewFactor;
-    if (quotingPolicy !== undefined) updateData.quotingPolicy = quotingPolicy;
+    if (bidOffsetTicks !== undefined) updateData.bidOffsetTicks = bidOffsetTicks;
+    if (askOffsetTicks !== undefined) updateData.askOffsetTicks = askOffsetTicks;
+    if (
+      targetSpread !== undefined ||
+      bidOffsetTicks !== undefined ||
+      askOffsetTicks !== undefined
+    ) {
+      updateData.quotingPolicy = "offsets";
+    }
     if (minTimeToResolution !== undefined) updateData.minTimeToResolution = minTimeToResolution;
     if (paused !== undefined) updateData.paused = paused;
     if (active !== undefined) updateData.active = active;

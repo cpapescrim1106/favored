@@ -1,14 +1,156 @@
 import { prisma } from "../lib/db.js";
-import { getPositions } from "@favored/shared";
+import { configureCLOB, getPositions, fetchActiveOrders } from "@favored/shared";
 
 const INVENTORY_DRIFT_THRESHOLD = Number(
   process.env.MM_INVENTORY_DRIFT_THRESHOLD ?? 1
 );
 
+/**
+ * Analyze the likely cause of inventory drift
+ */
+async function analyzeDriftCause(
+  mm: {
+    id: string;
+    yesInventory: unknown;
+    noInventory: unknown;
+    market?: { slug?: string; clobTokenIds?: string[] } | null;
+  },
+  outcome: "YES" | "NO",
+  dbValue: number,
+  chainValue: number
+): Promise<{
+  likelyCause: string;
+  details: Record<string, unknown>;
+}> {
+  const drift = dbValue - chainValue;
+  const isDecrease = chainValue < dbValue;
+  const details: Record<string, unknown> = {
+    outcome,
+    dbInventory: dbValue,
+    chainPosition: chainValue,
+    drift,
+  };
+
+  try {
+    // Check recent fills for this market maker
+    const recentFills = await prisma.marketMakerFill.findMany({
+      where: {
+        marketMakerId: mm.id,
+        outcome,
+        filledAt: { gte: new Date(Date.now() - 60 * 60 * 1000) }, // Last hour
+      },
+      orderBy: { filledAt: "desc" },
+      take: 10,
+    });
+
+    details.recentFillCount = recentFills.length;
+
+    // Check if we have tracked orders for this market
+    const trackedOrders = await prisma.marketMakerOrder.findMany({
+      where: { marketMakerId: mm.id, outcome },
+    });
+    details.trackedOrderCount = trackedOrders.length;
+
+    // Fetch active CLOB orders to check for orphan orders
+    const clobOrders = await fetchActiveOrders();
+    const tokenId = outcome === "YES"
+      ? mm.market?.clobTokenIds?.[0]
+      : mm.market?.clobTokenIds?.[1];
+
+    if (clobOrders && tokenId) {
+      const matchingOrders = clobOrders.filter((o) => o.asset_id === tokenId);
+      details.activeClobOrders = matchingOrders.length;
+    }
+
+    // Analyze the situation
+    if (chainValue === 0 && dbValue > 0) {
+      // Position completely gone from chain
+      if (recentFills.some((f) => f.side === "SELL")) {
+        return {
+          likelyCause: "EXTERNAL_SALE",
+          details: {
+            ...details,
+            explanation: "Position sold outside of MM system (possibly via Polymarket.com UI)",
+          },
+        };
+      }
+
+      // Check if this could be a merge (YES + NO = USDC)
+      const otherOutcome = outcome === "YES" ? "NO" : "YES";
+      const otherDbValue = outcome === "YES" ? Number(mm.noInventory) : Number(mm.yesInventory);
+      if (otherDbValue === 0) {
+        return {
+          likelyCause: "POSITION_MERGED",
+          details: {
+            ...details,
+            explanation: "Both YES and NO positions gone - likely merged to USDC",
+          },
+        };
+      }
+
+      return {
+        likelyCause: "POSITION_DISAPPEARED",
+        details: {
+          ...details,
+          explanation: "Position vanished from chain without tracked sale",
+          possibleReasons: ["External sale", "Market resolution", "Position merge", "API data lag"],
+        },
+      };
+    }
+
+    if (isDecrease) {
+      // Chain has less than DB - something reduced our position
+      const recentSells = recentFills.filter((f) => f.side === "SELL");
+      if (recentSells.length > 0) {
+        const sellTotal = recentSells.reduce((sum, f) => sum + Number(f.size), 0);
+        if (Math.abs(sellTotal - Math.abs(drift)) < 1) {
+          return {
+            likelyCause: "TRACKED_SELLS_NOT_SYNCED",
+            details: {
+              ...details,
+              explanation: "Recent sells match drift - DB likely just needs sync",
+              recentSellTotal: sellTotal,
+            },
+          };
+        }
+      }
+
+      return {
+        likelyCause: "UNTRACKED_REDUCTION",
+        details: {
+          ...details,
+          explanation: "Position reduced but no matching tracked activity",
+          possibleReasons: ["External sale on Polymarket.com", "Partial merge", "Order filled without tracking"],
+        },
+      };
+    } else {
+      // Chain has MORE than DB - we got tokens we didn't track
+      return {
+        likelyCause: "UNTRACKED_INCREASE",
+        details: {
+          ...details,
+          explanation: "Position increased but no matching tracked buy",
+          possibleReasons: ["External purchase", "Fill recorded late", "DB sync issue"],
+        },
+      };
+    }
+  } catch (error) {
+    return {
+      likelyCause: "ANALYSIS_ERROR",
+      details: {
+        ...details,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
 export async function runReconcileJob(): Promise<void> {
   console.log("[Reconcile] Starting reconciliation...");
 
   try {
+    configureCLOB({ dryRun: false });
+
     // Get all open positions
     const positions = await prisma.position.findMany({
       where: { status: "OPEN" },
@@ -86,6 +228,17 @@ export async function runReconcileJob(): Promise<void> {
       sizeThreshold: 0,
       limit: 500,
     });
+    if (!dataApiPositions) {
+      console.warn("[Reconcile] Data API unavailable; skipping MM reconciliation");
+      await prisma.log.create({
+        data: {
+          level: "WARN",
+          category: "RECONCILE",
+          message: "Data API unavailable during MM reconciliation",
+        },
+      });
+      return;
+    }
 
     if (dataApiPositions.length === 0 && trackedInventoryTotal > 0) {
       console.warn(
@@ -133,6 +286,28 @@ export async function runReconcileJob(): Promise<void> {
         Math.abs(noDrift) >= INVENTORY_DRIFT_THRESHOLD
       ) {
         driftCount++;
+
+        // Analyze the cause of drift for each outcome with significant drift
+        const driftAnalysis: Record<string, unknown> = {};
+
+        if (Math.abs(yesDrift) >= INVENTORY_DRIFT_THRESHOLD) {
+          const yesAnalysis = await analyzeDriftCause(mm, "YES", trackedYes, actualYes);
+          driftAnalysis.yesCause = yesAnalysis.likelyCause;
+          driftAnalysis.yesDetails = yesAnalysis.details;
+          console.log(
+            `[Reconcile] YES drift for ${mm.market?.slug}: ${yesAnalysis.likelyCause} - ${yesAnalysis.details.explanation || ""}`
+          );
+        }
+
+        if (Math.abs(noDrift) >= INVENTORY_DRIFT_THRESHOLD) {
+          const noAnalysis = await analyzeDriftCause(mm, "NO", trackedNo, actualNo);
+          driftAnalysis.noCause = noAnalysis.likelyCause;
+          driftAnalysis.noDetails = noAnalysis.details;
+          console.log(
+            `[Reconcile] NO drift for ${mm.market?.slug}: ${noAnalysis.likelyCause} - ${noAnalysis.details.explanation || ""}`
+          );
+        }
+
         await prisma.log.create({
           data: {
             level: "WARN",
@@ -150,6 +325,7 @@ export async function runReconcileJob(): Promise<void> {
               yesDrift,
               noDrift,
               threshold: INVENTORY_DRIFT_THRESHOLD,
+              ...driftAnalysis,
             },
           },
         });

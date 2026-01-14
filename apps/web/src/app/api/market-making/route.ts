@@ -1,6 +1,6 @@
 import { prisma } from "@/lib/db";
 import { NextRequest, NextResponse } from "next/server";
-import { getBalance } from "@favored/shared";
+import { getBalance, getBestPrices } from "@favored/shared";
 
 /**
  * GET /api/market-making
@@ -23,6 +23,7 @@ export async function GET() {
             yesPrice: true,
             noPrice: true,
             endDate: true,
+            clobTokenIds: true,
           },
         },
         orders: true,
@@ -32,6 +33,42 @@ export async function GET() {
       },
       orderBy: { createdAt: "desc" },
     });
+
+    const now = Date.now();
+    const since24h = new Date(now - 24 * 60 * 60 * 1000);
+    const since1w = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+    const [pnl24hRaw, pnl1wRaw, lastFillRaw] = await Promise.all([
+      prisma.marketMakerFill.groupBy({
+        by: ["marketMakerId"],
+        where: {
+          filledAt: { gte: since24h },
+        },
+        _sum: { realizedPnl: true },
+      }),
+      prisma.marketMakerFill.groupBy({
+        by: ["marketMakerId"],
+        where: {
+          filledAt: { gte: since1w },
+        },
+        _sum: { realizedPnl: true },
+      }),
+      // Get the most recent fill timestamp for each market maker
+      prisma.marketMakerFill.groupBy({
+        by: ["marketMakerId"],
+        _max: { filledAt: true },
+      }),
+    ]);
+
+    const pnl24hById = new Map(
+      pnl24hRaw.map((row) => [row.marketMakerId, Number(row._sum.realizedPnl ?? 0)])
+    );
+    const pnl1wById = new Map(
+      pnl1wRaw.map((row) => [row.marketMakerId, Number(row._sum.realizedPnl ?? 0)])
+    );
+    const lastFillById = new Map(
+      lastFillRaw.map((row) => [row.marketMakerId, row._max.filledAt])
+    );
 
     // Calculate unrealized P&L for each market maker
     // Unrealized = (currentPrice - avgCost) × inventory
@@ -94,6 +131,30 @@ export async function GET() {
       // Silently fail - will show "—" in UI
     }
 
+    const bestBidResults = await Promise.all(
+      marketMakers.map(async (mm) => {
+        const yesTokenId = mm.market?.clobTokenIds?.[0];
+        const noTokenId = mm.market?.clobTokenIds?.[1];
+
+        if (!yesTokenId || !noTokenId) {
+          return { yesBestBid: null, noBestBid: null };
+        }
+
+        try {
+          const [yesBest, noBest] = await Promise.all([
+            getBestPrices(yesTokenId),
+            getBestPrices(noTokenId),
+          ]);
+          return {
+            yesBestBid: yesBest.bestBid ?? null,
+            noBestBid: noBest.bestBid ?? null,
+          };
+        } catch (e) {
+          return { yesBestBid: null, noBestBid: null };
+        }
+      })
+    );
+
     return NextResponse.json({
       mmEnabled: config?.mmEnabled ?? false,
       summary: {
@@ -107,7 +168,7 @@ export async function GET() {
         totalAtRisk,
         cashAvailable,
       },
-      marketMakers: marketMakers.map((mm) => ({
+      marketMakers: marketMakers.map((mm, index) => ({
         id: mm.id,
         marketId: mm.marketId,
         market: mm.market
@@ -117,6 +178,8 @@ export async function GET() {
               category: mm.market.category,
               yesPrice: mm.market.yesPrice ? Number(mm.market.yesPrice) : null,
               noPrice: mm.market.noPrice ? Number(mm.market.noPrice) : null,
+              yesBestBid: bestBidResults[index]?.yesBestBid ?? null,
+              noBestBid: bestBidResults[index]?.noBestBid ?? null,
               endDate: mm.market.endDate?.toISOString() || null,
             }
           : null,
@@ -127,6 +190,8 @@ export async function GET() {
         maxInventory: Number(mm.maxInventory),
         skewFactor: Number(mm.skewFactor),
         quotingPolicy: mm.quotingPolicy,
+        bidOffsetTicks: mm.bidOffsetTicks ?? null,
+        askOffsetTicks: mm.askOffsetTicks ?? null,
         yesInventory: Number(mm.yesInventory),
         noInventory: Number(mm.noInventory),
         avgYesCost: Number(mm.avgYesCost),
@@ -134,6 +199,8 @@ export async function GET() {
         realizedPnl: Number(mm.realizedPnl),
         unrealizedPnl: calculateUnrealizedPnl(mm),
         totalPnl: Number(mm.realizedPnl) + calculateUnrealizedPnl(mm),
+        pnl24h: pnl24hById.get(mm.id) ?? 0,
+        pnl1w: pnl1wById.get(mm.id) ?? 0,
         minTimeToResolution: mm.minTimeToResolution,
         volatilityPauseUntil: mm.volatilityPauseUntil?.toISOString() || null,
         orders: mm.orders.map((o) => ({
@@ -144,6 +211,7 @@ export async function GET() {
           size: Number(o.size),
         })),
         fillCount: mm._count.fills,
+        lastFillAt: lastFillById.get(mm.id)?.toISOString() || null,
         lastQuoteAt: mm.lastQuoteAt?.toISOString() || null,
         createdAt: mm.createdAt.toISOString(),
       })),
@@ -171,7 +239,8 @@ export async function POST(request: NextRequest) {
       orderSize,
       maxInventory,
       skewFactor,
-      quotingPolicy,
+      bidOffsetTicks,
+      askOffsetTicks,
       minTimeToResolution,
     } = body;
 
@@ -216,7 +285,9 @@ export async function POST(request: NextRequest) {
         orderSize: orderSize ?? Number(config?.mmDefaultOrderSize ?? 100),
         maxInventory: maxInventory ?? Number(config?.mmDefaultMaxInventory ?? 500),
         skewFactor: skewFactor ?? Number(config?.mmDefaultSkewFactor ?? 0.04),
-        quotingPolicy: quotingPolicy ?? config?.mmDefaultQuotingPolicy ?? "touch",
+        quotingPolicy: "offsets",
+        bidOffsetTicks: bidOffsetTicks ?? null,
+        askOffsetTicks: askOffsetTicks ?? null,
         minTimeToResolution: minTimeToResolution ?? config?.mmMinTimeToResolution ?? 24,
         active: true,
         paused: false,
@@ -265,6 +336,8 @@ export async function POST(request: NextRequest) {
         maxInventory: Number(marketMaker.maxInventory),
         skewFactor: Number(marketMaker.skewFactor),
         quotingPolicy: marketMaker.quotingPolicy,
+        bidOffsetTicks: marketMaker.bidOffsetTicks ?? null,
+        askOffsetTicks: marketMaker.askOffsetTicks ?? null,
         yesInventory: Number(marketMaker.yesInventory),
         noInventory: Number(marketMaker.noInventory),
         realizedPnl: Number(marketMaker.realizedPnl),

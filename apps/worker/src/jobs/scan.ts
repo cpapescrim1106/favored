@@ -4,6 +4,7 @@ import {
   deriveCategoryFromTags,
   fetchAllActiveMarkets,
 } from "@favored/shared/polymarket";
+import { getVenueAdapter, registerDefaultVenues } from "@favored/shared/venues";
 import { scoreCandidate, type ScoringInput } from "@favored/shared/scoring";
 import { randomUUID } from "crypto";
 
@@ -37,6 +38,8 @@ export async function runScanJob(): Promise<void> {
 
     let candidatesCreated = 0;
     let marketsUpdated = 0;
+    let slugConflicts = 0;
+    const slugConflictSamples: string[] = [];
 
     for (const market of markets) {
       // Parse outcomes and prices from JSON strings
@@ -129,40 +132,56 @@ export async function runScanJob(): Promise<void> {
       }
 
       // Upsert market data
-      await prisma.market.upsert({
-        where: { id: market.id },
-        update: {
-          slug: market.slug,
-          eventSlug,
-          question: market.question,
-          category,
-          endDate: endDate,
-          active: market.active && !market.closed,
-          yesPrice: yesPrice,
-          noPrice: noPrice,
-          spread: spread,
-          liquidity: liquidityValue,
-          volume24h: volume24h,
-          clobTokenIds,
-          lastUpdated: new Date(),
-        },
-        create: {
-          id: market.id,
-          slug: market.slug,
-          eventSlug,
-          question: market.question,
-          category,
-          endDate: endDate,
-          active: market.active && !market.closed,
-          yesPrice: yesPrice,
-          noPrice: noPrice,
-          spread: spread,
-          liquidity: liquidityValue,
-          volume24h: volume24h,
-          clobTokenIds,
-          lastUpdated: new Date(),
-        },
-      });
+      try {
+        await prisma.market.upsert({
+          where: { id: market.id },
+          update: {
+            slug: market.slug,
+            eventSlug,
+            question: market.question,
+            category,
+            endDate: endDate,
+            active: market.active && !market.closed,
+            yesPrice: yesPrice,
+            noPrice: noPrice,
+            spread: spread,
+            liquidity: liquidityValue,
+            volume24h: volume24h,
+            clobTokenIds,
+            lastUpdated: new Date(),
+          },
+          create: {
+            id: market.id,
+            venue: "POLYMARKET",
+            slug: market.slug,
+            eventSlug,
+            question: market.question,
+            category,
+            endDate: endDate,
+            active: market.active && !market.closed,
+            yesPrice: yesPrice,
+            noPrice: noPrice,
+            spread: spread,
+            liquidity: liquidityValue,
+            volume24h: volume24h,
+            clobTokenIds,
+            lastUpdated: new Date(),
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("Unique constraint failed") && message.includes("slug")) {
+          slugConflicts++;
+          if (slugConflictSamples.length < 5) {
+            slugConflictSamples.push(`${market.id}:${market.slug}`);
+          }
+          console.warn(
+            `[Scan] Slug conflict for market ${market.id} (${market.slug}); skipping update`
+          );
+          continue;
+        }
+        throw error;
+      }
       marketsUpdated++;
 
       // Score both YES and NO sides
@@ -205,9 +224,143 @@ export async function runScanJob(): Promise<void> {
       }
     }
 
+    // Optional Kalshi scan
+    registerDefaultVenues();
+    const kalshiEnabled = process.env.KALSHI_SCAN_ENABLED === "true";
+    if (kalshiEnabled) {
+      const kalshi = getVenueAdapter("kalshi");
+      const kalshiMarkets = await kalshi.listMarkets({
+        status: "active",
+        limit: Number(process.env.KALSHI_SCAN_LIMIT ?? 1000),
+        maxPages: Number(process.env.KALSHI_SCAN_PAGES ?? 3),
+      });
+
+      console.log(`[Scan] Fetched ${kalshiMarkets.length} Kalshi markets`);
+
+      for (const market of kalshiMarkets) {
+        const yesPrice = market.yesPrice ?? null;
+        const noPrice = market.noPrice ?? (yesPrice !== null ? 1 - yesPrice : null);
+        if (yesPrice === null || noPrice === null) continue;
+
+        const liquidityValue = market.liquidity ?? 0;
+        if (minLiquidity && liquidityValue < minLiquidity) continue;
+
+        const volume24h = market.volume24h ?? 0;
+        const endDate = market.closeTime ? new Date(market.closeTime) : null;
+        const daysToClose = endDate
+          ? Math.max(0, (endDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24))
+          : 365;
+
+        const category = deriveCategory("", market.question, market.eventId ?? "");
+
+        const rawSpread = market.metadata && typeof market.metadata === "object"
+          ? Number((market.metadata as Record<string, unknown>).yes_ask ?? NaN) -
+            Number((market.metadata as Record<string, unknown>).yes_bid ?? NaN)
+          : NaN;
+        const spread = Number.isFinite(rawSpread)
+          ? rawSpread
+          : Math.abs(1 - yesPrice - noPrice);
+
+        await prisma.market.upsert({
+          where: { id: market.venueMarketId },
+          update: {
+            venue: "KALSHI",
+            slug: market.slug,
+            eventTicker: market.eventId ?? null,
+            question: market.question,
+            category,
+            endDate,
+            active: market.status === "active",
+            yesPrice,
+            noPrice,
+            spread: Number.isFinite(spread) ? spread : null,
+            liquidity: liquidityValue,
+            volume24h,
+            priceLevelStructure: market.priceLevelStructure ?? null,
+            priceRanges: market.priceRanges ?? null,
+            clobTokenIds: [],
+            lastUpdated: new Date(),
+          },
+          create: {
+            id: market.venueMarketId,
+            venue: "KALSHI",
+            slug: market.slug,
+            eventTicker: market.eventId ?? null,
+            question: market.question,
+            category,
+            endDate,
+            active: market.status === "active",
+            yesPrice,
+            noPrice,
+            spread: Number.isFinite(spread) ? spread : null,
+            liquidity: liquidityValue,
+            volume24h,
+            priceLevelStructure: market.priceLevelStructure ?? null,
+            priceRanges: market.priceRanges ?? null,
+            clobTokenIds: [],
+            lastUpdated: new Date(),
+          },
+        });
+
+        marketsUpdated++;
+
+        for (const side of ["YES", "NO"] as const) {
+          const price = side === "YES" ? yesPrice : noPrice;
+          const impliedProb = price;
+
+          const scoringInput: ScoringInput = {
+            impliedProb,
+            spread: Number.isFinite(spread) ? spread : 0,
+            liquidity: liquidityValue,
+            daysToClose,
+            volume24h,
+          };
+
+          const result = scoreCandidate(scoringInput, {
+            minProb: Number(config.minProb),
+            maxProb: Number(config.maxProb),
+            maxSpread: Number(config.maxSpread),
+            minLiquidity: Number(config.minLiquidity),
+          });
+
+          if (result.eligible) {
+            await prisma.candidate.create({
+              data: {
+                marketId: market.venueMarketId,
+                side,
+                outcomeName: side === "YES" ? "Yes" : "No",
+                impliedProb,
+                score: result.score,
+                spreadOk: spread <= Number(config.maxSpread),
+                liquidityOk: liquidityValue >= Number(config.minLiquidity),
+                scanId,
+                scannedAt: new Date(),
+              },
+            });
+            candidatesCreated++;
+          }
+        }
+      }
+    }
+
     const duration = Date.now() - startTime;
 
     // Log scan completion
+    if (slugConflicts > 0) {
+      await prisma.log.create({
+        data: {
+          level: "WARN",
+          category: "SCAN",
+          message: `Scan skipped ${slugConflicts} markets due to slug conflicts`,
+          metadata: {
+            scanId,
+            slugConflicts,
+            slugConflictSamples,
+          },
+        },
+      });
+    }
+
     await prisma.log.create({
       data: {
         level: "INFO",
@@ -217,6 +370,8 @@ export async function runScanJob(): Promise<void> {
           scanId,
           marketsUpdated,
           candidatesCreated,
+          slugConflicts,
+          slugConflictSamples,
           durationMs: duration,
         },
       },

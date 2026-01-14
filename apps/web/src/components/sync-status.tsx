@@ -2,8 +2,12 @@
 
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import {
   RefreshCw,
   CheckCircle,
@@ -11,6 +15,7 @@ import {
   XCircle,
   Loader2,
   RotateCcw,
+  ChevronDown,
 } from "lucide-react";
 import {
   AlertDialog,
@@ -25,12 +30,15 @@ import {
 } from "@/components/ui/alert-dialog";
 
 interface SyncStatus {
-  status: "SYNCED" | "DRIFT_DETECTED" | "ERROR";
+  status: "SYNCED" | "DRIFT_DETECTED" | "DEGRADED" | "ERROR";
+  degradedReasons?: string[];
+  stale?: boolean;
   orders: {
     clob: number;
     db: number;
     match: boolean;
     error?: string;
+    stale?: boolean;
   };
   positions: {
     chain: number;
@@ -40,6 +48,7 @@ interface SyncStatus {
     drift: string;
     match: boolean;
     error?: string;
+    stale?: boolean;
   };
   lastSync: string | null;
 }
@@ -130,172 +139,186 @@ export function SyncStatus() {
     }
   };
 
-  if (loading) {
-    return (
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium">Data Integrity</CardTitle>
-        </CardHeader>
-        <CardContent className="flex items-center justify-center py-4">
-          <Loader2 className="h-4 w-4 animate-spin" />
-        </CardContent>
-      </Card>
-    );
-  }
-
   const getStatusIcon = () => {
+    if (loading) return <Loader2 className="h-4 w-4 animate-spin" />;
     if (!status) return <XCircle className="h-4 w-4 text-gray-400" />;
     switch (status.status) {
       case "SYNCED":
         return <CheckCircle className="h-4 w-4 text-green-500" />;
       case "DRIFT_DETECTED":
         return <AlertTriangle className="h-4 w-4 text-yellow-500" />;
+      case "DEGRADED":
+        return <AlertTriangle className="h-4 w-4 text-orange-500" />;
       default:
         return <XCircle className="h-4 w-4 text-red-500" />;
     }
   };
 
   const getStatusBadge = () => {
+    if (loading) return null;
     if (!status) return <Badge variant="outline">Unknown</Badge>;
     switch (status.status) {
       case "SYNCED":
-        return <Badge className="bg-green-500">Synced</Badge>;
+        return <Badge className="bg-green-500 hover:bg-green-500">Synced</Badge>;
       case "DRIFT_DETECTED":
-        return <Badge className="bg-yellow-500">Drift Detected</Badge>;
+        return <Badge className="bg-yellow-500 hover:bg-yellow-500">Drift</Badge>;
+      case "DEGRADED":
+        return <Badge className="bg-orange-500 hover:bg-orange-500">Degraded</Badge>;
       default:
         return <Badge variant="destructive">Error</Badge>;
     }
   };
 
   return (
-    <Card>
-      <CardHeader className="pb-2">
-        <div className="flex items-center justify-between">
-          <CardTitle className="text-sm font-medium flex items-center gap-2">
-            {getStatusIcon()}
-            Data Integrity
-          </CardTitle>
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="outline" size="sm" className="gap-2">
+          {getStatusIcon()}
+          <span className="hidden sm:inline">Data Integrity</span>
           {getStatusBadge()}
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {status && (
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div>
-              <div className="text-muted-foreground">Orders</div>
-              <div className="font-mono">
-                CLOB: {status.orders.clob} / DB: {status.orders.db}
-                {!status.orders.match && (
-                  <span className="text-yellow-500 ml-1">!</span>
-                )}
+          <ChevronDown className="h-3 w-3 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-80" align="end">
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <h4 className="font-medium text-sm">Data Integrity</h4>
+            {getStatusBadge()}
+          </div>
+
+          {status && (
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <div>
+                <div className="text-muted-foreground text-xs">Orders</div>
+                <div className="font-mono">
+                  CLOB: {status.orders.clob} / DB: {status.orders.db}
+                  {!status.orders.match && (
+                    <span className="text-yellow-500 ml-1">!</span>
+                  )}
+                  {status.orders.stale && (
+                    <span className="text-orange-500 ml-1">(stale)</span>
+                  )}
+                </div>
+              </div>
+              <div>
+                <div className="text-muted-foreground text-xs">Positions</div>
+                <div className="font-mono">
+                  Chain: {status.positions.chainTotal} / DB: {status.positions.dbTotal}
+                  {!status.positions.match && (
+                    <span className="text-yellow-500 ml-1">
+                      ({status.positions.drift})
+                    </span>
+                  )}
+                  {status.positions.stale && (
+                    <span className="text-orange-500 ml-1">(stale)</span>
+                  )}
+                </div>
               </div>
             </div>
-            <div>
-              <div className="text-muted-foreground">Positions</div>
-              <div className="font-mono">
-                Chain: {status.positions.chainTotal} / DB: {status.positions.dbTotal}
-                {!status.positions.match && (
-                  <span className="text-yellow-500 ml-1">
-                    ({status.positions.drift})
-                  </span>
-                )}
-              </div>
+          )}
+
+          {status?.status === "DEGRADED" && (
+            <div className="text-sm text-orange-500">
+              Dependencies unavailable; showing cached data
+              {status.degradedReasons?.length
+                ? ` (${status.degradedReasons.join(", ")})`
+                : "."}
             </div>
-          </div>
-        )}
+          )}
 
-        {status?.orders.error && (
-          <div className="text-sm text-red-500">
-            CLOB Error: {status.orders.error}
-          </div>
-        )}
-        {status?.positions.error && (
-          <div className="text-sm text-red-500">
-            Chain Error: {status.positions.error}
-          </div>
-        )}
-
-        {lastResult && (
-          <div className="text-sm border rounded p-2 bg-muted/50">
-            <div className="font-medium mb-1">
-              Last Sync: {lastResult.success ? "Success" : "Failed"} ({lastResult.duration}ms)
+          {status?.orders.error && (
+            <div className="text-sm text-red-500">
+              CLOB Error: {status.orders.error}
             </div>
-            {lastResult.ordersRemoved > 0 && (
-              <div>Stale orders removed: {lastResult.ordersRemoved}</div>
-            )}
-            {lastResult.positionsCorrected > 0 && (
-              <div>Positions corrected: {lastResult.positionsCorrected}</div>
-            )}
-            {lastResult.issues.length > 0 && (
-              <div className="mt-1 text-muted-foreground">
-                {lastResult.issues.length} issues found
+          )}
+          {status?.positions.error && (
+            <div className="text-sm text-red-500">
+              Chain Error: {status.positions.error}
+            </div>
+          )}
+
+          {lastResult && (
+            <div className="text-sm border rounded p-2 bg-muted/50">
+              <div className="font-medium mb-1">
+                Last Sync: {lastResult.success ? "Success" : "Failed"} ({lastResult.duration}ms)
               </div>
-            )}
-          </div>
-        )}
+              {lastResult.ordersRemoved > 0 && (
+                <div>Stale orders removed: {lastResult.ordersRemoved}</div>
+              )}
+              {lastResult.positionsCorrected > 0 && (
+                <div>Positions corrected: {lastResult.positionsCorrected}</div>
+              )}
+              {lastResult.issues.length > 0 && (
+                <div className="mt-1 text-muted-foreground">
+                  {lastResult.issues.length} issues found
+                </div>
+              )}
+            </div>
+          )}
 
-        {status?.lastSync && (
-          <div className="text-xs text-muted-foreground">
-            Last full sync: {new Date(status.lastSync).toLocaleString()}
-          </div>
-        )}
+          {status?.lastSync && (
+            <div className="text-xs text-muted-foreground">
+              Last full sync: {new Date(status.lastSync).toLocaleString()}
+            </div>
+          )}
 
-        <div className="flex gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleSync}
-            disabled={syncing || resetting}
-            className="flex-1"
-          >
-            {syncing ? (
-              <Loader2 className="h-4 w-4 mr-1 animate-spin" />
-            ) : (
-              <RefreshCw className="h-4 w-4 mr-1" />
-            )}
-            Sync Now
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleSync}
+              disabled={syncing || resetting}
+              className="flex-1"
+            >
+              {syncing ? (
+                <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+              ) : (
+                <RefreshCw className="h-4 w-4 mr-1" />
+              )}
+              Sync Now
+            </Button>
 
-          <AlertDialog>
-            <AlertDialogTrigger asChild>
-              <Button
-                variant="destructive"
-                size="sm"
-                disabled={syncing || resetting}
-              >
-                {resetting ? (
-                  <Loader2 className="h-4 w-4 mr-1 animate-spin" />
-                ) : (
-                  <RotateCcw className="h-4 w-4 mr-1" />
-                )}
-                Reset
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Reset to Chain State?</AlertDialogTitle>
-                <AlertDialogDescription>
-                  This will reset ALL market maker inventory to match on-chain
-                  positions and clear ALL tracked orders. This is a nuclear
-                  option - only use if the database is completely out of sync.
-                  <br />
-                  <br />
-                  <strong>Note:</strong> Realized P&L history will be preserved.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  onClick={handleReset}
-                  className="bg-destructive text-destructive-foreground"
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={syncing || resetting}
                 >
-                  Reset to Chain
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
+                  {resetting ? (
+                    <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                  ) : (
+                    <RotateCcw className="h-4 w-4 mr-1" />
+                  )}
+                  Reset
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Reset to Chain State?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    This will reset ALL market maker inventory to match on-chain
+                    positions and clear ALL tracked orders. This is a nuclear
+                    option - only use if the database is completely out of sync.
+                    <br />
+                    <br />
+                    <strong>Note:</strong> Realized P&L history will be preserved.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    onClick={handleReset}
+                    className="bg-destructive text-destructive-foreground"
+                  >
+                    Reset to Chain
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </div>
         </div>
-      </CardContent>
-    </Card>
+      </PopoverContent>
+    </Popover>
   );
 }

@@ -9,6 +9,9 @@ import { Wallet } from "ethers";
 import { ClobClient } from "@polymarket/clob-client";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import axios from "axios";
+import dns from "dns";
+import https from "https";
+import type { LookupFunction } from "net";
 import type {
   CLOBOrder,
   CLOBPosition,
@@ -43,6 +46,21 @@ export interface ProxyConfig {
   port?: number;
 }
 
+const ipv4Lookup: LookupFunction = (hostname, options, callback) => {
+  const normalized =
+    typeof options === "object" && options !== null
+      ? { ...options, family: 4 }
+      : { family: 4 };
+  dns.lookup(hostname, normalized, callback);
+};
+
+const ipv4Agent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  lookup: ipv4Lookup,
+});
+
 /**
  * CLOB API Client Configuration
  */
@@ -73,9 +91,9 @@ export async function checkGeoblock(proxyAgent?: HttpsProxyAgent<string>): Promi
   error?: string;
 }> {
   try {
+    const config = getAxiosConfig(proxyAgent);
     const response = await axios.get(GEOBLOCK_URL, {
-      httpsAgent: proxyAgent,
-      proxy: false, // Don't use system proxy
+      ...config,
       timeout: 10000,
     });
 
@@ -105,7 +123,11 @@ export async function checkGeoblock(proxyAgent?: HttpsProxyAgent<string>): Promi
 export function createProxyAgent(config: ProxyConfig): HttpsProxyAgent<string> {
   const port = config.port || 80;
   const proxyUrl = `http://${config.user}:${config.pass}@${config.server}:${port}`;
-  return new HttpsProxyAgent(proxyUrl);
+  return new HttpsProxyAgent(proxyUrl, {
+    keepAlive: true,
+    maxSockets: 50,
+    maxFreeSockets: 10,
+  });
 }
 
 /**
@@ -125,6 +147,16 @@ export function getProxyConfigFromEnv(): ProxyConfig | null {
     pass,
     server,
     port: parseInt(process.env.SURFSHARK_PORT || "80", 10),
+  };
+}
+
+function getAxiosConfig(proxyAgent?: HttpsProxyAgent<string>): {
+  httpsAgent: HttpsProxyAgent<string> | https.Agent;
+  proxy: false;
+} {
+  return {
+    httpsAgent: proxyAgent ?? ipv4Agent,
+    proxy: false,
   };
 }
 
@@ -343,7 +375,7 @@ export async function fetchPositions(): Promise<CLOBPosition[]> {
 /**
  * Fetch active orders
  */
-export async function fetchActiveOrders(): Promise<CLOBOrder[]> {
+export async function fetchActiveOrders(): Promise<CLOBOrder[] | null> {
   if (clobConfig.dryRun || !isCLOBConfigured()) {
     console.log("[CLOB] Dry run mode - returning empty orders");
     return [];
@@ -366,7 +398,7 @@ export async function fetchActiveOrders(): Promise<CLOBOrder[]> {
     }));
   } catch (error) {
     console.error("[CLOB] Failed to fetch orders:", error);
-    return [];
+    return null;
   }
 }
 
@@ -725,9 +757,7 @@ export async function getOrderbook(
   tokenId: string
 ): Promise<{ bids: Array<{ price: number; size: number }>; asks: Array<{ price: number; size: number }> }> {
   try {
-    const config = proxyAgentInstance
-      ? { httpsAgent: proxyAgentInstance, proxy: false as const }
-      : {};
+    const config = getAxiosConfig(proxyAgentInstance ?? undefined);
 
     const response = await axios.get(`${CLOB_HOST}/book?token_id=${tokenId}`, config);
     const data = response.data;
@@ -822,9 +852,7 @@ export async function getMakerPrice(
  */
 export async function getMidpointPrice(tokenId: string): Promise<number | null> {
   try {
-    const config = proxyAgentInstance
-      ? { httpsAgent: proxyAgentInstance, proxy: false as const }
-      : {};
+    const config = getAxiosConfig(proxyAgentInstance ?? undefined);
 
     const response = await axios.get(`${CLOB_HOST}/midpoint?token_id=${tokenId}`, config);
     return response.data.mid ? parseFloat(response.data.mid) : null;
@@ -839,9 +867,7 @@ export async function getMidpointPrice(tokenId: string): Promise<number | null> 
  */
 export async function getSpread(tokenId: string): Promise<number | null> {
   try {
-    const config = proxyAgentInstance
-      ? { httpsAgent: proxyAgentInstance, proxy: false as const }
-      : {};
+    const config = getAxiosConfig(proxyAgentInstance ?? undefined);
 
     const response = await axios.get(`${CLOB_HOST}/spread?token_id=${tokenId}`, config);
     return response.data.spread ? parseFloat(response.data.spread) : null;
@@ -909,33 +935,31 @@ export async function getBalance(): Promise<{ balance: number; allowance: number
 export async function getPositions(
   userAddress?: string,
   options?: { sizeThreshold?: number; limit?: number }
-): Promise<DataAPIPosition[]> {
+): Promise<DataAPIPosition[] | null> {
   const address = userAddress || process.env.POLYMARKET_FUNDER_ADDRESS;
   if (!address) {
     console.error("[CLOB] No user address provided and POLYMARKET_FUNDER_ADDRESS not set");
-    return [];
+    return null;
   }
 
   const sizeThreshold = options?.sizeThreshold ?? 0;
   const limit = options?.limit ?? 100;
 
   try {
-    const config = proxyAgentInstance
-      ? { httpsAgent: proxyAgentInstance, proxy: false as const }
-      : {};
+    const config = getAxiosConfig(proxyAgentInstance ?? undefined);
 
     const url = `${DATA_API_HOST}/positions?user=${address}&sizeThreshold=${sizeThreshold}&limit=${limit}`;
     const response = await axios.get(url, config);
 
     if (!Array.isArray(response.data)) {
       console.error("[CLOB] Unexpected response from Data API positions endpoint");
-      return [];
+      return null;
     }
 
     return response.data as DataAPIPosition[];
   } catch (error) {
     console.error("[CLOB] Failed to fetch positions from Data API:", error);
-    return [];
+    return null;
   }
 }
 

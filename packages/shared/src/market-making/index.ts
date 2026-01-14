@@ -16,7 +16,13 @@ export const TICK_SIZE = 0.01;
 export const MIN_PRICE = 0.01;
 export const MAX_PRICE = 0.99;
 
-export type QuotingPolicy = "touch" | "inside" | "back" | "defensive" | "tiered";
+export type QuotingPolicy =
+  | "touch"
+  | "inside"
+  | "back"
+  | "defensive"
+  | "tiered"
+  | "offsets";
 
 export interface QuoteParams {
   midPrice: number;
@@ -25,10 +31,15 @@ export interface QuoteParams {
   skewFactor: number; // Max spread adjustment at full inventory
   orderSize: number; // Shares per side
   maxInventory: number; // Max shares exposure
+  tickSize?: number; // Optional tick size override (default: 0.01)
+  minPrice?: number; // Optional min price override
+  maxPrice?: number; // Optional max price override
   quotingPolicy?: QuotingPolicy; // Where to place quotes
   bestBid?: number; // Current best bid (for policy)
   bestAsk?: number; // Current best ask (for policy)
   avgCost?: number; // Average cost of inventory (for aggressive sell sizing)
+  bidOffsetTicks?: number; // Ticks behind best bid (if configured)
+  askOffsetTicks?: number; // Ticks above best ask (if configured)
 }
 
 export interface Quote {
@@ -85,7 +96,12 @@ export function calculateQuotes(params: QuoteParams): Quote {
     bestAsk,
   } = params;
 
+  const tickSize = params.tickSize ?? TICK_SIZE;
+  const minPrice = params.minPrice ?? MIN_PRICE;
+  const maxPrice = params.maxPrice ?? MAX_PRICE;
   const halfSpread = targetSpread / 2;
+  const profitFloor =
+    params.avgCost !== undefined && params.avgCost > 0 ? params.avgCost + tickSize : null;
 
   // Normalize inventory to [-1, 1] range
   const invNorm = Math.max(-1, Math.min(1, inventory / maxInventory));
@@ -106,14 +122,30 @@ export function calculateQuotes(params: QuoteParams): Quote {
   } else if (quotingPolicy === "inside" && bestBid !== undefined && bestAsk !== undefined) {
     // Check if spread is wide enough to go inside (need > 1 tick)
     const currentSpread = bestAsk - bestBid;
-    if (currentSpread > TICK_SIZE) {
+    if (currentSpread > tickSize) {
       // Improve by one tick inside the spread
-      bidPrice = Math.max(bidPrice, bestBid + TICK_SIZE);
-      askPrice = Math.min(askPrice, bestAsk - TICK_SIZE);
+      bidPrice = Math.max(bidPrice, bestBid + tickSize);
+      askPrice = Math.min(askPrice, bestAsk - tickSize);
     } else {
       // Spread too tight (1 tick or less), fall back to touch
       bidPrice = Math.min(bidPrice, bestBid);
       askPrice = Math.max(askPrice, bestAsk);
+    }
+  } else if (
+    quotingPolicy === "offsets" ||
+    params.bidOffsetTicks !== undefined ||
+    params.askOffsetTicks !== undefined
+  ) {
+    const avgCost = params.avgCost ?? 0;
+
+    if (params.bidOffsetTicks !== undefined && bestBid !== undefined) {
+      bidPrice = bestBid - params.bidOffsetTicks * tickSize;
+    }
+    if (params.askOffsetTicks !== undefined && bestAsk !== undefined) {
+      askPrice = bestAsk + params.askOffsetTicks * tickSize;
+    }
+    if (profitFloor !== null) {
+      askPrice = Math.max(askPrice, profitFloor);
     }
   } else if (quotingPolicy === "defensive" && bestBid !== undefined && bestAsk !== undefined) {
     // Defensive policy: simple spread capture
@@ -127,19 +159,23 @@ export function calculateQuotes(params: QuoteParams): Quote {
 
     // SELL SIDE: touch at best ask, but floor at cost basis
     askPrice = bestAsk;
-    if (avgCost > 0) {
-      askPrice = Math.max(askPrice, avgCost);
+    if (profitFloor !== null) {
+      askPrice = Math.max(askPrice, profitFloor);
     }
   }
   // "back" policy: use calculated prices as-is (back of the book)
 
+  if (profitFloor !== null) {
+    askPrice = Math.max(askPrice, profitFloor);
+  }
+
   // Round to tick size and clamp to valid range
-  bidPrice = roundToTick(clampPrice(bidPrice));
-  askPrice = roundToTick(clampPrice(askPrice));
+  bidPrice = roundToTick(clampPrice(bidPrice, minPrice, maxPrice), tickSize);
+  askPrice = roundToTick(clampPrice(askPrice, minPrice, maxPrice), tickSize);
 
   // Ensure ask > bid (maintain valid spread)
   if (askPrice <= bidPrice) {
-    askPrice = bidPrice + TICK_SIZE;
+    askPrice = bidPrice + tickSize;
   }
 
   // Determine if we're in reduce-only mode (near inventory cap)
@@ -190,6 +226,9 @@ export function calculateTieredQuotes(
   tierConfig: TierConfig
 ): TieredQuote[] {
   const { bestBid, bestAsk, orderSize, inventory, maxInventory } = params;
+  const tickSize = params.tickSize ?? TICK_SIZE;
+  const minPrice = params.minPrice ?? MIN_PRICE;
+  const maxPrice = params.maxPrice ?? MAX_PRICE;
 
   const quotes: TieredQuote[] = [];
   const invNorm = Math.max(-1, Math.min(1, inventory / maxInventory));
@@ -221,8 +260,8 @@ export function calculateTieredQuotes(
       const sizePercent = tierConfig.sizes[i] ?? (1 / tierConfig.bidOffsets.length);
 
       // Price = bestBid - offset (in cents, so multiply by TICK_SIZE)
-      let price = bestBid - offset * TICK_SIZE;
-      price = roundToTick(clampPrice(price));
+      let price = bestBid - offset * tickSize;
+      price = roundToTick(clampPrice(price, minPrice, maxPrice), tickSize);
 
       const size = Math.round(totalBidSize * sizePercent * 100) / 100; // Round to 2 decimals
 
@@ -244,8 +283,8 @@ export function calculateTieredQuotes(
       const sizePercent = tierConfig.sizes[i] ?? (1 / tierConfig.askOffsets.length);
 
       // Price = bestAsk + offset (behind the best ask)
-      let price = bestAsk + offset * TICK_SIZE;
-      price = roundToTick(clampPrice(price));
+      let price = bestAsk + offset * tickSize;
+      price = roundToTick(clampPrice(price, minPrice, maxPrice), tickSize);
 
       const size = Math.round(totalAskSize * sizePercent * 100) / 100;
 
@@ -281,15 +320,19 @@ export function parseTierConfig(
 /**
  * Clamp price to valid Polymarket range [MIN_PRICE, MAX_PRICE]
  */
-function clampPrice(price: number): number {
-  return Math.max(MIN_PRICE, Math.min(MAX_PRICE, price));
+function clampPrice(
+  price: number,
+  minPrice: number = MIN_PRICE,
+  maxPrice: number = MAX_PRICE
+): number {
+  return Math.max(minPrice, Math.min(maxPrice, price));
 }
 
 /**
  * Round price to valid Polymarket tick size ($0.01)
  */
-export function roundToTick(price: number): number {
-  return Math.round(price / TICK_SIZE) * TICK_SIZE;
+export function roundToTick(price: number, tickSize: number = TICK_SIZE): number {
+  return Math.round(price / tickSize) * tickSize;
 }
 
 /**

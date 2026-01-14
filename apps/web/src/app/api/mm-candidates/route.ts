@@ -72,19 +72,32 @@ export async function GET(request: NextRequest) {
     // Screen each market
     for (const market of markets) {
       try {
-        // Get YES token ID from clobTokenIds (first element is YES)
+        // Get YES/NO token IDs from clobTokenIds (YES first, NO second)
         const yesTokenId = market.clobTokenIds?.[0];
+        const noTokenId = market.clobTokenIds?.[1];
         if (!yesTokenId) {
           console.log(`[MM Candidates] Skipping ${market.slug} - no clobTokenIds`);
           continue;
         }
 
-        // Fetch orderbook, midpoint, and spread from CLOB in parallel
-        const [book, midpoint, spread] = await Promise.all([
+        // Fetch YES orderbook, midpoint, and spread from CLOB in parallel
+        const [yesBook, yesMidpoint, yesSpread] = await Promise.all([
           getOrderbook(yesTokenId),
           getMidpointPrice(yesTokenId),
           getSpread(yesTokenId),
         ]);
+
+        // Fetch NO book if available
+        let noBook = undefined;
+        let noMidpoint: number | null = null;
+        let noSpread: number | null = null;
+        if (noTokenId) {
+          [noBook, noMidpoint, noSpread] = await Promise.all([
+            getOrderbook(noTokenId),
+            getMidpointPrice(noTokenId),
+            getSpread(noTokenId),
+          ]);
+        }
 
         // Screen the market with CLOB pricing (more accurate than raw book)
         const result = screenMarketForMM(
@@ -97,9 +110,13 @@ export async function GET(request: NextRequest) {
             yesPrice: market.yesPrice ? Number(market.yesPrice) : null,
             volume24h: market.volume24h ? Number(market.volume24h) : 0,
           },
-          book,
+          yesBook,
           params,
-          { midpoint, spread }
+          {
+            yes: { midpoint: yesMidpoint, spread: yesSpread },
+            no: noTokenId ? { midpoint: noMidpoint, spread: noSpread } : undefined,
+          },
+          noBook
         );
 
         // Filter based on eligibility and score
@@ -138,12 +155,16 @@ export async function GET(request: NextRequest) {
         depth3c: r.depth3cTotal,
         bookSlope: r.bookSlope,
         volume24h: r.volume24h,
+        queueSpeed: r.queueSpeed,
+        queueDepthRatio: r.queueDepthRatio,
         hoursToEnd: r.hoursToEnd,
         scores: {
           liquidity: r.liquidityScore,
           flow: r.flowScore,
           time: r.timeScore,
           priceZone: r.priceZoneScore,
+          queueSpeed: r.queueSpeedScore,
+          queueDepth: r.queueDepthScore,
           total: r.totalScore,
         },
         flags: r.flags,

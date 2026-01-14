@@ -10,6 +10,12 @@ export async function GET() {
   try {
     // Fetch positions from Polymarket Data API
     const positions = await getPositions();
+    if (!positions) {
+      return NextResponse.json(
+        { error: "Data API unavailable" },
+        { status: 502 }
+      );
+    }
 
     // Fetch cash balance
     let cashBalance = 0;

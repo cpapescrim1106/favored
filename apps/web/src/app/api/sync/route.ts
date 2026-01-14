@@ -16,6 +16,32 @@ import {
   configureCLOB,
 } from "@favored/shared";
 
+const STATUS_STALE_MS = Number(process.env.SYNC_STATUS_STALE_MS ?? 120000);
+
+type LastSnapshot = {
+  timestamp: number;
+  clobOrdersCount: number;
+  chainPositionsCount: number;
+  chainTotal: number;
+};
+
+let lastSnapshot: LastSnapshot | null = null;
+
+async function withRetry<T>(
+  fn: () => Promise<T | null>,
+  attempts = 2,
+  delayMs = 250
+): Promise<T | null> {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const result = await fn();
+    if (result !== null) return result;
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+    }
+  }
+  return null;
+}
+
 interface SyncIssue {
   type: string;
   severity: "INFO" | "WARN" | "ERROR" | "CRITICAL";
@@ -65,58 +91,100 @@ export async function GET() {
     }
 
     // Get CLOB orders (with error handling)
-    let clobOrders: Awaited<ReturnType<typeof fetchActiveOrders>> = [];
+    let clobOrdersCount = 0;
     let clobError: string | null = null;
+    let clobStale = false;
 
-    try {
-      configureCLOB({ dryRun: false });
-      clobOrders = await fetchActiveOrders();
-    } catch (e) {
-      clobError = e instanceof Error ? e.message : String(e);
+    configureCLOB({ dryRun: false });
+    const clobOrdersResult = await withRetry(() => fetchActiveOrders());
+    if (!clobOrdersResult) {
+      clobError = "CLOB unavailable";
+      if (lastSnapshot) {
+        clobStale = true;
+        clobOrdersCount = lastSnapshot.clobOrdersCount;
+      }
+    } else {
+      clobOrdersCount = clobOrdersResult.filter((o) =>
+        trackedTokenIds.has(o.asset_id)
+      ).length;
     }
 
     // Get chain positions (with error handling)
-    let chainPositions: Awaited<ReturnType<typeof getPositions>> = [];
+    let chainPositions: NonNullable<Awaited<ReturnType<typeof getPositions>>> = [];
+    let chainPositionsCount = 0;
     let chainError: string | null = null;
+    let chainStale = false;
 
-    try {
-      chainPositions = await getPositions(undefined, {
-        sizeThreshold: 0,
-        limit: 500,
-      });
-    } catch (e) {
-      chainError = e instanceof Error ? e.message : String(e);
+    const chainPositionsResult = await withRetry(() =>
+      getPositions(undefined, { sizeThreshold: 0, limit: 500 })
+    );
+    if (!chainPositionsResult) {
+      chainError = "Data API unavailable";
+      if (lastSnapshot) {
+        chainStale = true;
+        chainPositionsCount = lastSnapshot.chainPositionsCount;
+      }
+    } else {
+      chainPositions = chainPositionsResult;
+      chainPositionsCount = chainPositions.length;
     }
 
     // Calculate totals - only for MM-tracked tokens
-    const chainTotal = chainPositions
+    let chainTotal = chainPositions
       .filter((p) => trackedTokenIds.has(p.asset))
       .reduce((sum, p) => sum + p.size, 0);
     const dbTotal = marketMakers.reduce(
       (sum, mm) => sum + Number(mm.yesInventory) + Number(mm.noInventory),
       0
     );
+    if (chainStale && lastSnapshot) {
+      chainTotal = lastSnapshot.chainTotal;
+    }
 
     // Check for drift
-    const ordersMatch = clobOrders.length === dbOrders;
-    const positionsMatch = Math.abs(chainTotal - dbTotal) < 1;
+    const ordersMatch = !clobError && clobOrdersCount === dbOrders;
+    const positionsMatch = !chainError && Math.abs(chainTotal - dbTotal) < 1;
+    const degradedReasons: string[] = [];
+    if (clobError) degradedReasons.push("CLOB_UNAVAILABLE");
+    if (chainError) degradedReasons.push("DATA_API_UNAVAILABLE");
+
+    const now = Date.now();
+    const status =
+      clobError || chainError
+        ? "DEGRADED"
+        : ordersMatch && positionsMatch
+          ? "SYNCED"
+          : "DRIFT_DETECTED";
+
+    if (!clobError && !chainError) {
+      lastSnapshot = {
+        timestamp: now,
+        clobOrdersCount,
+        chainPositionsCount,
+        chainTotal,
+      };
+    }
 
     return NextResponse.json({
-      status: ordersMatch && positionsMatch ? "SYNCED" : "DRIFT_DETECTED",
+      status,
+      degradedReasons,
+      stale: lastSnapshot ? now - lastSnapshot.timestamp > STATUS_STALE_MS : false,
       orders: {
-        clob: clobOrders.length,
+        clob: clobOrdersCount,
         db: dbOrders,
         match: ordersMatch,
         error: clobError,
+        stale: clobStale,
       },
       positions: {
-        chain: chainPositions.length,
+        chain: chainPositionsCount,
         chainTotal: chainTotal.toFixed(2),
         db: marketMakers.length,
         dbTotal: dbTotal.toFixed(2),
         drift: (chainTotal - dbTotal).toFixed(2),
         match: positionsMatch,
         error: chainError,
+        stale: chainStale,
       },
       lastSync: await getLastSyncTime(),
     });
@@ -223,6 +291,12 @@ export async function DELETE(request: NextRequest) {
       sizeThreshold: 0,
       limit: 500,
     });
+    if (!chainPositions) {
+      return NextResponse.json(
+        { error: "Data API unavailable" },
+        { status: 502 }
+      );
+    }
 
     const positionMap = new Map(
       chainPositions.map((p) => [
@@ -309,6 +383,15 @@ async function syncOrders(
 ): Promise<void> {
   // Fetch CLOB orders
   const clobOrders = await fetchActiveOrders();
+  if (!clobOrders) {
+    issues.push({
+      type: "CLOB_UNAVAILABLE",
+      severity: "CRITICAL",
+      details: { reason: "fetchActiveOrders_failed" },
+      action: "LOGGED",
+    });
+    return;
+  }
   result.ordersInClob = clobOrders.length;
 
   // Fetch DB orders
@@ -332,7 +415,7 @@ async function syncOrders(
       if (
         orderStatus.status === "not_found" ||
         (orderStatus.status === "ok" &&
-          ["MATCHED", "CANCELLED", "EXPIRED"].includes(
+          ["MATCHED", "CANCELLED", "CANCELED", "EXPIRED"].includes(
             orderStatus.order?.status?.toUpperCase() || ""
           ))
       ) {
@@ -375,7 +458,7 @@ async function syncOrders(
 async function syncPositions(
   result: SyncResult,
   issues: SyncIssue[],
-  _autoCorrect: boolean, // Unused - positions are always alert-only
+  _autoCorrect: boolean,
   _verbose: boolean
 ): Promise<void> {
   // Get all MMs FIRST to calculate tracked inventory
@@ -384,36 +467,21 @@ async function syncPositions(
   });
   result.marketMakersInDb = marketMakers.length;
 
-  // Calculate total tracked inventory BEFORE fetching chain positions
-  const totalTrackedInventory = marketMakers.reduce(
-    (sum, mm) => sum + Number(mm.yesInventory) + Number(mm.noInventory),
-    0
-  );
-
   // Fetch chain positions
   const chainPositions = await getPositions(undefined, {
     sizeThreshold: 0,
     limit: 500,
   });
-  result.positionsInChain = chainPositions.length;
-
-  // EMPTY RESPONSE GUARD: Protect against zeroing inventory on empty API response
-  if (chainPositions.length === 0 && totalTrackedInventory > 1.0) {
-    console.error(
-      "[Sync API] EMPTY RESPONSE GUARD: Data API returned empty but DB has inventory"
-    );
+  if (!chainPositions) {
     issues.push({
-      type: "POSITION_DRIFT",
+      type: "DATA_API_UNAVAILABLE",
       severity: "CRITICAL",
-      details: {
-        guard: "empty_response_protection",
-        trackedInventory: totalTrackedInventory,
-        action: "sync_skipped",
-      },
+      details: { reason: "getPositions_failed" },
       action: "LOGGED",
     });
-    return; // DO NOT PROCEED - prevent zeroing inventory
+    return;
   }
+  result.positionsInChain = chainPositions.length;
 
   const positionMap = new Map(
     chainPositions.map((p) => [
@@ -422,60 +490,78 @@ async function syncPositions(
     ])
   );
 
-  // ALERT-ONLY MODE: Without a dedicated MM wallet, we can't distinguish
-  // MM positions from manual trades. Log drift for review, never auto-correct.
+  // Data API is authoritative for full-wallet positions. Overwrite DB.
   for (const mm of marketMakers) {
     const yesTokenId = mm.market?.clobTokenIds?.[0];
     const noTokenId = mm.market?.clobTokenIds?.[1];
 
-    // Check YES
-    if (yesTokenId) {
-      const chainPos = positionMap.get(yesTokenId);
-      const dbInventory = Number(mm.yesInventory);
-      const chainSize = chainPos?.size ?? 0;
-      const drift = Math.abs(dbInventory - chainSize);
-
-      if (drift > 0.1) {
-        issues.push({
-          type: "POSITION_DRIFT",
-          severity: drift > 10 ? "ERROR" : "WARN",
-          marketSlug: mm.market?.slug,
-          details: {
-            outcome: "YES",
-            dbInventory,
-            chainSize,
-            drift,
-            note: "Manual review required - no auto-correction without dedicated wallet",
-          },
-          action: "LOGGED", // NEVER auto-correct positions
-        });
-        // DO NOT UPDATE DB - alert only
-      }
+    if (!yesTokenId || !noTokenId) {
+      continue;
     }
 
-    // Check NO
-    if (noTokenId) {
-      const chainPos = positionMap.get(noTokenId);
-      const dbInventory = Number(mm.noInventory);
-      const chainSize = chainPos?.size ?? 0;
-      const drift = Math.abs(dbInventory - chainSize);
+    const yesPos = positionMap.get(yesTokenId);
+    const noPos = positionMap.get(noTokenId);
 
-      if (drift > 0.1) {
-        issues.push({
-          type: "POSITION_DRIFT",
-          severity: drift > 10 ? "ERROR" : "WARN",
-          marketSlug: mm.market?.slug,
-          details: {
-            outcome: "NO",
-            dbInventory,
-            chainSize,
-            drift,
-            note: "Manual review required - no auto-correction without dedicated wallet",
-          },
-          action: "LOGGED", // NEVER auto-correct positions
-        });
-        // DO NOT UPDATE DB - alert only
-      }
+    const dbYes = Number(mm.yesInventory);
+    const dbNo = Number(mm.noInventory);
+    const dbAvgYes = Number(mm.avgYesCost);
+    const dbAvgNo = Number(mm.avgNoCost);
+
+    const nextYes = yesPos?.size ?? 0;
+    const nextNo = noPos?.size ?? 0;
+    const nextAvgYes = yesPos?.avgPrice ?? 0;
+    const nextAvgNo = noPos?.avgPrice ?? 0;
+
+    const yesDrift = Math.abs(dbYes - nextYes);
+    const noDrift = Math.abs(dbNo - nextNo);
+    const yesAvgDrift = Math.abs(dbAvgYes - nextAvgYes);
+    const noAvgDrift = Math.abs(dbAvgNo - nextAvgNo);
+
+    if (yesDrift > 0.1 || yesAvgDrift > 0.0001) {
+      issues.push({
+        type: "POSITION_DRIFT",
+        severity: yesDrift > 0.1 ? "ERROR" : "WARN",
+        marketSlug: mm.market?.slug,
+        details: {
+          outcome: "YES",
+          dbInventory: dbYes,
+          chainSize: nextYes,
+          drift: yesDrift,
+          chainAvgPrice: nextAvgYes,
+          dbAvgCost: dbAvgYes,
+        },
+        action: "CORRECTED",
+      });
+    }
+
+    if (noDrift > 0.1 || noAvgDrift > 0.0001) {
+      issues.push({
+        type: "POSITION_DRIFT",
+        severity: noDrift > 0.1 ? "ERROR" : "WARN",
+        marketSlug: mm.market?.slug,
+        details: {
+          outcome: "NO",
+          dbInventory: dbNo,
+          chainSize: nextNo,
+          drift: noDrift,
+          chainAvgPrice: nextAvgNo,
+          dbAvgCost: dbAvgNo,
+        },
+        action: "CORRECTED",
+      });
+    }
+
+    if (yesDrift > 0.0001 || noDrift > 0.0001 || yesAvgDrift > 0.0001 || noAvgDrift > 0.0001) {
+      await prisma.marketMaker.update({
+        where: { id: mm.id },
+        data: {
+          yesInventory: nextYes,
+          noInventory: nextNo,
+          avgYesCost: nextAvgYes,
+          avgNoCost: nextAvgNo,
+        },
+      });
+      result.positionsCorrected++;
     }
   }
 }

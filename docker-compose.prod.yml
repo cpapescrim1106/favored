@@ -28,6 +28,8 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       NODE_ENV: production
+      NODE_OPTIONS: --dns-result-order=ipv4first
+      CLOB_WS_HOST: wss://ws-live-data.polymarket.com
     ports:
       - "3000:3000"
 
@@ -46,6 +48,8 @@ services:
       POLYMARKET_PASSPHRASE: ${POLYMARKET_PASSPHRASE}
       WALLET_PRIVATE_KEY: ${WALLET_PRIVATE_KEY}
       NODE_ENV: production
+      NODE_OPTIONS: --dns-result-order=ipv4first
+      CLOB_WS_HOST: wss://ws-live-data.polymarket.com
       SCAN_INTERVAL: "*/10 * * * *"
 
 volumes:

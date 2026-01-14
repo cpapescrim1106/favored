@@ -3,18 +3,26 @@ import { runScanJob } from "./jobs/scan.js";
 import { runReconcileJob } from "./jobs/reconcile.js";
 import { runExitCheckJob } from "./jobs/exit-check.js";
 import { runMarketMakingJob } from "./jobs/market-making.js";
-import { fullSync, quickSync } from "./jobs/data-integrity.js";
+import { runKalshiMarketMakingJob } from "./jobs/market-making-kalshi.js";
+import { fullSync, quickSync, syncInventoryFromChain } from "./jobs/data-integrity.js";
 import { prisma } from "./lib/db.js";
+import { startClobUserWs, stopClobUserWs } from "./ws/clob-user.js";
 
 const SCAN_INTERVAL = process.env.SCAN_INTERVAL || "*/10 * * * *"; // Every 10 minutes
-const MM_INTERVAL = process.env.MM_INTERVAL || "*/30 * * * * *"; // Every 30 seconds
+const MM_INTERVAL = process.env.MM_INTERVAL || "*/5 * * * * *"; // Every 5 seconds
 const SYNC_INTERVAL = process.env.SYNC_INTERVAL || "0 * * * *"; // Every hour (sync is now alert-only)
+const INVENTORY_SYNC_INTERVAL = process.env.INVENTORY_SYNC_INTERVAL || "*/30 * * * * *"; // Every 30 seconds
 
 async function main() {
   console.log("[Worker] Starting Favored worker service...");
   console.log(`[Worker] Scan interval: ${SCAN_INTERVAL}`);
   console.log(`[Worker] Market Making interval: ${MM_INTERVAL}`);
   console.log(`[Worker] Data Sync interval: ${SYNC_INTERVAL}`);
+  console.log(`[Worker] Inventory Sync interval: ${INVENTORY_SYNC_INTERVAL}`);
+  if (process.env.CLOB_WS_ENABLED === "true") {
+    console.log("[Worker] CLOB WS listener enabled");
+    startClobUserWs();
+  }
 
   // Run initial data integrity sync on startup (corrects any drift)
   console.log("[Worker] Running initial data integrity sync...");
@@ -40,6 +48,12 @@ async function main() {
     await runMarketMakingJobWrapper();
   });
 
+  // Schedule independent inventory sync (every 30 seconds, offset from MM job)
+  // This catches drift faster than waiting for the full sync
+  cron.schedule(INVENTORY_SYNC_INTERVAL, async () => {
+    await runInventorySyncWrapper();
+  });
+
   // Schedule data integrity sync (every 5 minutes)
   cron.schedule(SYNC_INTERVAL, async () => {
     await runDataIntegritySyncWrapper();
@@ -59,10 +73,33 @@ async function runMarketMakingJobWrapper() {
   try {
     // Run MM job (includes fill checking)
     await runMarketMakingJob();
+    if (process.env.KALSHI_MM_ENABLED === "true") {
+      await runKalshiMarketMakingJob();
+    }
   } catch (error) {
     console.error("[Worker] Market making job error:", error);
   } finally {
     mmJobRunning = false;
+  }
+}
+
+// Wrapper to prevent overlapping inventory sync jobs
+let inventorySyncRunning = false;
+async function runInventorySyncWrapper() {
+  if (inventorySyncRunning) {
+    return; // Skip if previous sync is still running
+  }
+
+  inventorySyncRunning = true;
+  try {
+    const result = await syncInventoryFromChain();
+    if (result.corrected > 0) {
+      console.log(`[Worker] Inventory sync corrected ${result.corrected} positions`);
+    }
+  } catch (error) {
+    console.error("[Worker] Inventory sync error:", error);
+  } finally {
+    inventorySyncRunning = false;
   }
 }
 
@@ -139,12 +176,14 @@ async function runAllJobs() {
 // Handle graceful shutdown
 process.on("SIGTERM", async () => {
   console.log("[Worker] Received SIGTERM, shutting down...");
+  stopClobUserWs();
   await prisma.$disconnect();
   process.exit(0);
 });
 
 process.on("SIGINT", async () => {
   console.log("[Worker] Received SIGINT, shutting down...");
+  stopClobUserWs();
   await prisma.$disconnect();
   process.exit(0);
 });
