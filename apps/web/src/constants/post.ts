@@ -1,0 +1,1 @@
+export const EXCERPT_RECOMMENDED_LENGTH = 180;

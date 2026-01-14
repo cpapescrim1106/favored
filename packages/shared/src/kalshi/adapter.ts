@@ -1,12 +1,12 @@
 import type {
   OrderRequest,
   OrderResponse,
-  VenueAdapter,
   VenueFill,
   VenueMarket,
   VenueOrderbook,
   VenuePosition,
 } from "../venues/types.js";
+import type { VenueAdapter } from "../venues/adapter.js";
 import { clampPrice, quantizePrice } from "../venues/price.js";
 import { getKalshiSubaccount, kalshiRequest, parseFixedPoint } from "./client.js";
 import { normalizeKalshiOrderbook } from "./normalize.js";
@@ -114,7 +114,12 @@ function buildOrderRequest(
   const isAsk = request.side === "ASK";
   const isYes = request.outcome === "YES";
 
-  const translated = (() => {
+  const translated: {
+    side: "yes" | "no";
+    action: "buy" | "sell";
+    yes_price?: number;
+    no_price?: number;
+  } = (() => {
     if (!isAsk && isYes) {
       return { side: "yes", action: "buy", yes_price: priceCents };
     }
@@ -148,7 +153,7 @@ export class KalshiAdapter implements VenueAdapter {
   async listMarkets(params?: Record<string, unknown>): Promise<VenueMarket[]> {
     const limit = Number(params?.limit ?? 1000);
     const maxPages = Number(params?.maxPages ?? 5);
-    const status = params?.status ? String(params.status) : "active";
+    const status = params?.status ? String(params.status) : "open";
 
     const results: VenueMarket[] = [];
     let cursor = "";

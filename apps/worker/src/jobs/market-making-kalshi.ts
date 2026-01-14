@@ -5,6 +5,7 @@ import {
   calculateMidPrice,
   shouldRefreshQuotes,
   type Quote,
+  type QuotingPolicy,
 } from "@favored/shared/market-making";
 import {
   getTickSizeForPrice,
@@ -59,7 +60,7 @@ export async function runKalshiMarketMakingJob(): Promise<KalshiMarketMakingResu
   const adapter = getVenueAdapter("kalshi");
 
   const marketMakers = await prisma.marketMaker.findMany({
-    where: { active: true, market: { venue: "KALSHI" } },
+    where: { active: true, market: { is: { venue: "KALSHI" } } },
     include: { market: true, orders: true },
   });
 
@@ -133,7 +134,9 @@ export async function runKalshiMarketMakingJob(): Promise<KalshiMarketMakingResu
     const yesMid = calculateMidPrice(yesBestBid, yesBestAsk);
     const noMid = calculateMidPrice(noBestBid, noBestAsk);
 
-    const priceRanges = (mm.market.priceRanges ?? []) as PriceRange[];
+    const priceRanges = Array.isArray(mm.market.priceRanges)
+      ? (mm.market.priceRanges as unknown as PriceRange[])
+      : [];
     const yesTick = getTickSizeForPrice(yesMid, priceRanges);
     const noTick = getTickSizeForPrice(noMid, priceRanges);
 
@@ -158,6 +161,7 @@ export async function runKalshiMarketMakingJob(): Promise<KalshiMarketMakingResu
       continue;
     }
 
+    const quotingPolicy = mm.quotingPolicy as QuotingPolicy;
     const yesQuote = calculateQuotes({
       midPrice: yesMid,
       targetSpread: Number(mm.targetSpread),
@@ -165,7 +169,7 @@ export async function runKalshiMarketMakingJob(): Promise<KalshiMarketMakingResu
       skewFactor: Number(mm.skewFactor),
       orderSize: Number(mm.orderSize),
       maxInventory: Number(mm.maxInventory),
-      quotingPolicy: mm.quotingPolicy,
+      quotingPolicy,
       bestBid: yesBestBid,
       bestAsk: yesBestAsk,
       avgCost: Number(mm.avgYesCost),
@@ -181,7 +185,7 @@ export async function runKalshiMarketMakingJob(): Promise<KalshiMarketMakingResu
       skewFactor: Number(mm.skewFactor),
       orderSize: Number(mm.orderSize),
       maxInventory: Number(mm.maxInventory),
-      quotingPolicy: mm.quotingPolicy,
+      quotingPolicy,
       bestBid: noBestBid,
       bestAsk: noBestAsk,
       avgCost: Number(mm.avgNoCost),

@@ -8,9 +8,9 @@ import { getClobCredentials, getPositions } from "@favored/shared";
 import { prisma } from "../lib/db.js";
 import {
   logQuoteAction,
-  processFill,
   verifyFillAgainstChain,
 } from "../jobs/market-making.js";
+import { recordPendingFillEvent } from "../lib/fill-events.js";
 
 const DEFAULT_WS_HOST = "wss://ws-live-data.polymarket.com";
 const DEFAULT_PING_INTERVAL_MS = 5000;
@@ -96,6 +96,9 @@ const metrics = {
   basketUpdates: 0,
   mmFills: 0,
 };
+
+const POSITION_UPDATES_ENABLED = process.env.CLOB_WS_POSITION_UPDATES === "true";
+let positionUpdatesWarned = false;
 
 const orderLocks = new Map<string, Promise<void>>();
 const tokenMap = new Map<string, { marketMakerId: string; outcome: "YES" | "NO" }>();
@@ -256,7 +259,7 @@ const handleMarketMakerOrderUpdate = async (params: {
           mmOrder,
           sizeMatched
         );
-        if (!verification.verified) {
+        if (!verification.verified && verification.reason !== "chain_data_unavailable") {
           await logVerificationFailure({
             orderId: mmOrder.orderId,
             outcome: mmOrder.outcome,
@@ -265,19 +268,24 @@ const handleMarketMakerOrderUpdate = async (params: {
             reason: verification.reason,
             marketSlug: mmOrder.marketMaker.market?.slug ?? null,
           });
-        } else {
-          await processFill(
-            mmOrder.marketMaker,
-            {
-              ...mmOrder,
-              price: params.price ?? Number(mmOrder.price),
-              size: params.originalSize ?? Number(mmOrder.size),
-            },
-            undefined,
-            sizeMatched,
-            false,
-            true
-          );
+        }
+
+        const recorded = await recordPendingFillEvent({
+          marketMakerId: mmOrder.marketMakerId,
+          orderId: mmOrder.orderId,
+          outcome: mmOrder.outcome === "YES" ? "YES" : "NO",
+          side: mmOrder.side === "BID" ? "BUY" : "SELL",
+          price: params.price ?? Number(mmOrder.price),
+          size: sizeMatched,
+          matchedTotal: sizeMatched,
+          source: "ws",
+          metadata: {
+            verification: verification.verified ? "ok" : verification.reason,
+            status: params.status,
+            originalSize: params.originalSize ?? Number(mmOrder.size),
+          },
+        });
+        if (recorded) {
           metrics.mmFills += 1;
         }
       }
@@ -295,7 +303,7 @@ const handleMarketMakerOrderUpdate = async (params: {
         mmOrder,
         deltaMatched
       );
-      if (!verification.verified) {
+      if (!verification.verified && verification.reason !== "chain_data_unavailable") {
         await logVerificationFailure({
           orderId: mmOrder.orderId,
           outcome: mmOrder.outcome,
@@ -304,30 +312,37 @@ const handleMarketMakerOrderUpdate = async (params: {
           reason: verification.reason,
           marketSlug: mmOrder.marketMaker.market?.slug ?? null,
         });
-      } else {
-        await processFill(
-          mmOrder.marketMaker,
-          {
-            ...mmOrder,
-            price: params.price ?? Number(mmOrder.price),
-            size: params.originalSize ?? Number(mmOrder.size),
-          },
-          undefined,
-          deltaMatched,
-          false,
-          true
-        );
+      }
+
+      const recorded = await recordPendingFillEvent({
+        marketMakerId: mmOrder.marketMakerId,
+        orderId: mmOrder.orderId,
+        outcome: mmOrder.outcome === "YES" ? "YES" : "NO",
+        side: mmOrder.side === "BID" ? "BUY" : "SELL",
+        price: params.price ?? Number(mmOrder.price),
+        size: deltaMatched,
+        matchedTotal: sizeMatched,
+        source: "ws",
+        metadata: {
+          verification: verification.verified ? "ok" : verification.reason,
+          status: params.status,
+          originalSize: params.originalSize ?? Number(mmOrder.size),
+          previousMatched: currentMatched,
+        },
+      });
+      if (recorded) {
         metrics.mmFills += 1;
-        if (isLive) {
-          await logQuoteAction(mmOrder.marketMakerId, "PARTIAL_FILL", {
-            outcome: mmOrder.outcome,
-            side: mmOrder.side,
-            orderId: mmOrder.orderId,
-            filledSize: deltaMatched,
-            totalMatched: sizeMatched,
-            originalSize: params.originalSize ?? Number(mmOrder.size),
-          });
-        }
+      }
+
+      if (verification.verified && isLive) {
+        await logQuoteAction(mmOrder.marketMakerId, "PARTIAL_FILL", {
+          outcome: mmOrder.outcome,
+          side: mmOrder.side,
+          orderId: mmOrder.orderId,
+          filledSize: deltaMatched,
+          totalMatched: sizeMatched,
+          originalSize: params.originalSize ?? Number(mmOrder.size),
+        });
       }
 
       await prisma.marketMakerOrder.updateMany({
@@ -407,6 +422,13 @@ const handleBasketOrderUpdate = async (params: {
 };
 
 const handlePositionUpdate = async (payload: ClobUserPositionPayload): Promise<void> => {
+  if (!POSITION_UPDATES_ENABLED) {
+    if (!positionUpdatesWarned) {
+      console.warn("[CLOB WS] Position updates disabled (chain sync is authoritative)");
+      positionUpdatesWarned = true;
+    }
+    return;
+  }
   const asset = payload.asset ?? payload.asset_id;
   if (!asset) return;
 

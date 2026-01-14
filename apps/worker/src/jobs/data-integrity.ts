@@ -11,11 +11,16 @@
 
 import { prisma } from "../lib/db.js";
 import {
+  confirmPendingFillsForMarketMaker,
+  recordPendingFillEvent,
+} from "../lib/fill-events.js";
+import {
   configureCLOB,
   fetchActiveOrders,
   getOrder,
   getPositions,
   cancelOrder,
+  type DataAPIPosition,
 } from "@favored/shared";
 
 const DEPENDENCY_FAILURE_THRESHOLD = Number(
@@ -290,6 +295,33 @@ async function syncOrders(
     if (!clobOrder) {
       // Order is in DB but not in CLOB - could be filled, cancelled, or expired
       // Verify with getOrder to check status
+      if (dbOrder.orderId.startsWith("dry-run-")) {
+        issues.push({
+          type: "ORDER_IN_DB_NOT_CLOB",
+          severity: "INFO",
+          marketSlug: dbOrder.marketMaker?.market?.slug,
+          details: {
+            orderId: dbOrder.orderId,
+            outcome: dbOrder.outcome,
+            side: dbOrder.side,
+            price: Number(dbOrder.price),
+            size: Number(dbOrder.size),
+            reason: "dry_run_order_id",
+          },
+          action: autoCorrect ? "CORRECTED" : "LOGGED",
+        });
+
+        if (autoCorrect) {
+          const removed = await prisma.marketMakerOrder.deleteMany({
+            where: { id: dbOrder.id },
+          });
+          if (removed.count > 0) {
+            result.ordersRemoved += removed.count;
+          }
+        }
+        continue;
+      }
+
       const orderStatus = await getOrder(dbOrder.orderId);
 
       if (orderStatus.status === "not_found") {
@@ -310,14 +342,26 @@ async function syncOrders(
         });
 
         if (autoCorrect) {
-          await prisma.marketMakerOrder.delete({ where: { id: dbOrder.id } });
-          result.ordersRemoved++;
-          if (verbose) {
-            console.log(`[DataIntegrity] Removed stale order ${dbOrder.orderId}`);
+          const removed = await prisma.marketMakerOrder.deleteMany({
+            where: { id: dbOrder.id },
+          });
+          if (removed.count > 0) {
+            result.ordersRemoved += removed.count;
+            if (verbose) {
+              console.log(`[DataIntegrity] Removed stale order ${dbOrder.orderId}`);
+            }
           }
         }
       } else if (orderStatus.status === "ok" && orderStatus.order) {
-        const status = orderStatus.order.status.toUpperCase();
+        const statusRaw = orderStatus.order.status;
+        if (typeof statusRaw !== "string") {
+          console.warn(
+            `[DataIntegrity] Order ${dbOrder.orderId} returned non-string status; skipping`
+          );
+          continue;
+        }
+
+        const status = statusRaw.toUpperCase();
         const sizeMatched = Number(orderStatus.order.size_matched || 0);
 
         if (status === "MATCHED" || status === "CANCELLED" || status === "CANCELED" || status === "EXPIRED") {
@@ -346,11 +390,16 @@ async function syncOrders(
                 dbOrder.marketMaker.id,
                 dbOrder,
                 sizeMatched - lastMatched,
-                Number(dbOrder.price)
+                Number(dbOrder.price),
+                sizeMatched
               );
             }
-            await prisma.marketMakerOrder.delete({ where: { id: dbOrder.id } });
-            result.ordersRemoved++;
+            const removed = await prisma.marketMakerOrder.deleteMany({
+              where: { id: dbOrder.id },
+            });
+            if (removed.count > 0) {
+              result.ordersRemoved += removed.count;
+            }
           }
         }
       }
@@ -413,7 +462,8 @@ async function syncOrders(
               dbOrder.marketMaker.id,
               dbOrder,
               unrecordedFill,
-              Number(dbOrder.price)
+              Number(dbOrder.price),
+              sizeMatched
             );
             await prisma.marketMakerOrder.updateMany({
               where: { id: dbOrder.id },
@@ -438,82 +488,30 @@ async function processUnrecordedFill(
     price: unknown;
   },
   fillSize: number,
-  fillPrice: number
+  fillPrice: number,
+  matchedTotal: number
 ): Promise<void> {
-  const isBuy = order.side === "BID";
-  const isYes = order.outcome === "YES";
-
-  // Get current MM state
-  const mm = await prisma.marketMaker.findUnique({
-    where: { id: marketMakerId },
+  const side = order.side === "BID" ? "BUY" : "SELL";
+  const recorded = await recordPendingFillEvent({
+    marketMakerId,
+    orderId: order.orderId,
+    outcome: order.outcome === "YES" ? "YES" : "NO",
+    side,
+    price: fillPrice,
+    size: fillSize,
+    matchedTotal,
+    source: "sync",
+    metadata: {
+      reason: "unrecorded_fill",
+      originalPrice: Number(order.price),
+    },
   });
-  if (!mm) return;
 
-  let yesInventory = Number(mm.yesInventory);
-  let noInventory = Number(mm.noInventory);
-  let avgYesCost = Number(mm.avgYesCost);
-  let avgNoCost = Number(mm.avgNoCost);
-  let realizedPnl = Number(mm.realizedPnl);
-  let fillRealizedPnl: number | null = null;
-  const value = fillPrice * fillSize;
-
-  if (isYes) {
-    if (isBuy) {
-      const totalCost = avgYesCost * yesInventory + value;
-      yesInventory += fillSize;
-      avgYesCost = yesInventory > 0 ? totalCost / yesInventory : 0;
-    } else {
-      if (yesInventory > 0) {
-        fillRealizedPnl = (fillPrice - avgYesCost) * fillSize;
-        realizedPnl += fillRealizedPnl;
-      }
-      yesInventory = Math.max(0, yesInventory - fillSize);
-      if (yesInventory <= 0) avgYesCost = 0;
-    }
-  } else {
-    if (isBuy) {
-      const totalCost = avgNoCost * noInventory + value;
-      noInventory += fillSize;
-      avgNoCost = noInventory > 0 ? totalCost / noInventory : 0;
-    } else {
-      if (noInventory > 0) {
-        fillRealizedPnl = (fillPrice - avgNoCost) * fillSize;
-        realizedPnl += fillRealizedPnl;
-      }
-      noInventory = Math.max(0, noInventory - fillSize);
-      if (noInventory <= 0) avgNoCost = 0;
-    }
+  if (recorded) {
+    console.log(
+      `[DataIntegrity] Recorded pending fill: ${order.outcome} ${side} @ ${fillPrice} x ${fillSize}`
+    );
   }
-
-  // Record the fill
-  await prisma.marketMakerFill.create({
-    data: {
-      marketMakerId,
-      outcome: order.outcome,
-      side: isBuy ? "BUY" : "SELL",
-      orderId: order.orderId,
-      price: fillPrice,
-      size: fillSize,
-      value,
-      realizedPnl: fillRealizedPnl,
-    },
-  });
-
-  // Update MM state
-  await prisma.marketMaker.update({
-    where: { id: marketMakerId },
-    data: {
-      yesInventory,
-      noInventory,
-      avgYesCost,
-      avgNoCost,
-      realizedPnl,
-    },
-  });
-
-  console.log(
-    `[DataIntegrity] Recorded unrecorded fill: ${order.outcome} ${order.side} @ ${fillPrice} x ${fillSize}`
-  );
 }
 
 // ============================================================================
@@ -603,6 +601,13 @@ async function syncPositions(
     const nextNo = noPos?.size ?? 0;
     const nextAvgYes = yesPos?.avgPrice ?? 0;
     const nextAvgNo = noPos?.avgPrice ?? 0;
+
+    const driftYesValue = nextYes - dbYes;
+    const driftNoValue = nextNo - dbNo;
+    await confirmPendingFillsForMarketMaker({
+      mm,
+      driftByOutcome: { YES: driftYesValue, NO: driftNoValue },
+    });
 
     const yesDrift = Math.abs(dbYes - nextYes);
     const noDrift = Math.abs(dbNo - nextNo);
@@ -844,7 +849,9 @@ export async function quickSync(): Promise<{
  *
  * @returns Number of positions corrected
  */
-export async function syncInventoryFromChain(): Promise<{
+export async function syncInventoryFromChain(options?: {
+  positions?: DataAPIPosition[];
+}): Promise<{
   synced: number;
   corrected: number;
   driftDetails: Array<{
@@ -869,10 +876,12 @@ export async function syncInventoryFromChain(): Promise<{
 
   try {
     // Fetch chain positions
-    const chainPositions = await getPositions(undefined, {
-      sizeThreshold: 0,
-      limit: 500,
-    });
+    const chainPositions =
+      options?.positions ??
+      (await getPositions(undefined, {
+        sizeThreshold: 0,
+        limit: 500,
+      }));
 
     if (!chainPositions) {
       console.warn("[InventorySync] Chain positions unavailable");
@@ -903,6 +912,11 @@ export async function syncInventoryFromChain(): Promise<{
       const chainNo = noPos?.size ?? 0;
       const chainAvgYes = yesPos?.avgPrice ?? 0;
       const chainAvgNo = noPos?.avgPrice ?? 0;
+
+      await confirmPendingFillsForMarketMaker({
+        mm,
+        driftByOutcome: { YES: chainYes - dbYes, NO: chainNo - dbNo },
+      });
 
       const yesDrift = Math.abs(dbYes - chainYes);
       const noDrift = Math.abs(dbNo - chainNo);

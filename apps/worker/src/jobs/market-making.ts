@@ -42,6 +42,10 @@ import {
   type TierConfig,
 } from "@favored/shared";
 import { addHours, isBefore } from "date-fns";
+import {
+  confirmPendingFillsForMarketMaker,
+  recordPendingFillEvent,
+} from "../lib/fill-events.js";
 
 // Minimum time between quote refreshes (ms)
 const MIN_QUOTE_INTERVAL = 5000;
@@ -93,9 +97,13 @@ type DependencyValueMap = {
   positions: PositionsResult;
 };
 type Cached<T> = { value: T; at: number };
-const dependencyCache: Partial<{
-  [K in DependencyKey]: Cached<DependencyValueMap[K]>;
-}> = {};
+const dependencyCache: Partial<
+  Record<DependencyKey, Cached<DependencyValueMap[DependencyKey]>>
+> = {};
+const getDependencyCache = <K extends DependencyKey>(
+  key: K
+): Cached<DependencyValueMap[K]> | undefined =>
+  dependencyCache[key] as Cached<DependencyValueMap[K]> | undefined;
 let lastNonEmptyOpenOrders: Cached<OpenOrdersResult> | null = null;
 let openOrdersEmptyStreak = 0;
 
@@ -127,7 +135,7 @@ async function getDependency<K extends DependencyKey>(
 }> {
   const now = Date.now();
   const state = dependencyState[key];
-  const cache = dependencyCache[key];
+  const cache = getDependencyCache(key);
   const cacheFresh = cache && now - cache.at <= DEPENDENCY_CACHE_MS;
 
   if (state.openUntil > now) {
@@ -145,7 +153,7 @@ async function getDependency<K extends DependencyKey>(
 
   const liveResult = await retryDependency(label, fn);
   if (liveResult !== null) {
-    dependencyCache[key] = { value: liveResult, at: now };
+    dependencyCache[key] = { value: liveResult, at: now } as Cached<DependencyValueMap[K]>;
     state.failureStreak = 0;
     state.openUntil = 0;
     return { value: liveResult, source: "live", degraded: false };
@@ -271,7 +279,7 @@ export async function runMarketMakingJob(): Promise<MarketMakingResult> {
 
     // Get all active market makers (inventory sync includes paused)
     const marketMakers = await prisma.marketMaker.findMany({
-      where: { active: true, market: { venue: "POLYMARKET" } },
+      where: { active: true, market: { is: { venue: "POLYMARKET" } } },
       include: { market: true },
     });
 
@@ -344,10 +352,10 @@ export async function runMarketMakingJob(): Promise<MarketMakingResult> {
 
     const trackedOrdersCount = await prisma.marketMakerOrder.count();
     if (openClobOrders.length === 0 && trackedOrdersCount > 0) {
-      const fallbackFresh =
+      if (
         lastNonEmptyOpenOrders &&
-        nowMs - lastNonEmptyOpenOrders.at <= DEPENDENCY_CACHE_MS;
-      if (fallbackFresh) {
+        nowMs - lastNonEmptyOpenOrders.at <= DEPENDENCY_CACHE_MS
+      ) {
         openClobOrders = lastNonEmptyOpenOrders.value;
         dependencyDegraded = true;
         openOrdersReliable = false;
@@ -412,7 +420,7 @@ export async function runMarketMakingJob(): Promise<MarketMakingResult> {
       where: {
         active: true,
         paused: false,
-        market: { venue: "POLYMARKET" },
+        market: { is: { venue: "POLYMARKET" } },
       },
       include: {
         market: true,
@@ -476,7 +484,7 @@ export async function runMarketMakingJob(): Promise<MarketMakingResult> {
       where: {
         active: true,
         paused: false,
-        market: { venue: "POLYMARKET" },
+        market: { is: { venue: "POLYMARKET" } },
       },
       include: {
         market: true,
@@ -551,6 +559,13 @@ async function syncInventoryFromChain(
     const nextAvgYes = yesPos?.avgPrice ?? 0;
     const nextAvgNo = noPos?.avgPrice ?? 0;
 
+    const driftYes = nextYes - Number(mm.yesInventory);
+    const driftNo = nextNo - Number(mm.noInventory);
+    await confirmPendingFillsForMarketMaker({
+      mm,
+      driftByOutcome: { YES: driftYes, NO: driftNo },
+    });
+
     const needsUpdate =
       Math.abs(Number(mm.yesInventory) - nextYes) > 0.0001 ||
       Math.abs(Number(mm.noInventory) - nextNo) > 0.0001 ||
@@ -591,8 +606,7 @@ export function verifyFillAgainstChain(
   fillSize: number
 ): { verified: boolean; reason?: string } {
   if (!chainPositionMap) {
-    // Can't verify - chain data unavailable, allow fill but log
-    return { verified: true, reason: "chain_data_unavailable" };
+    return { verified: false, reason: "chain_data_unavailable" };
   }
 
   const tokenId = order.outcome === "YES"
@@ -611,22 +625,27 @@ export function verifyFillAgainstChain(
 
   // For BUY fills: chain should have at least (dbInventory + fillSize) tokens
   // For SELL fills: chain should have (dbInventory - fillSize) tokens (could be 0)
-  const expectedMinPosition = isBuy
+  const expectedPosition = isBuy
     ? dbInventory + fillSize
     : Math.max(0, dbInventory - fillSize);
 
   // Allow some tolerance for rounding/timing
   const tolerance = 0.5;
 
-  if (isBuy && chainPosition < expectedMinPosition - tolerance) {
+  if (isBuy && chainPosition < expectedPosition - tolerance) {
     return {
       verified: false,
-      reason: `BUY fill not on chain: expected >=${expectedMinPosition.toFixed(2)}, got ${chainPosition.toFixed(2)}`,
+      reason: `BUY fill not on chain: expected >=${expectedPosition.toFixed(2)}, got ${chainPosition.toFixed(2)}`,
     };
   }
 
-  // For sells, verify we don't have MORE than expected (indicates buy happened instead)
-  // This is less strict since sells reduce inventory
+  if (!isBuy && chainPosition > expectedPosition + tolerance) {
+    return {
+      verified: false,
+      reason: `SELL fill not on chain: expected <=${expectedPosition.toFixed(2)}, got ${chainPosition.toFixed(2)}`,
+    };
+  }
+
   return { verified: true };
 }
 
@@ -666,6 +685,20 @@ async function checkAllFills(
       if (!("orders" in mm) || !Array.isArray(mm.orders)) continue;
 
       for (const order of mm.orders) {
+        if (order.orderId.startsWith("dry-run-")) {
+          console.warn(
+            `[MarketMaking] Removing dry-run order ${order.orderId} from DB tracking`
+          );
+          await prisma.marketMakerOrder.deleteMany({ where: { id: order.id } });
+          await logQuoteAction(mm.id, "ORDER_STALE", {
+            outcome: order.outcome,
+            side: order.side,
+            orderId: order.orderId,
+            error: "Dry-run order ID",
+          });
+          continue;
+        }
+
         const orderResult = await getOrder(order.orderId);
 
         if (orderResult.status === "error") {
@@ -689,7 +722,14 @@ async function checkAllFills(
         }
 
         const orderDetails = orderResult.order;
-        const status = orderDetails.status.toUpperCase();
+        const statusRaw = orderDetails.status;
+        if (typeof statusRaw !== "string") {
+          console.warn(
+            `[MarketMaking] Order ${order.orderId} returned non-string status; skipping`
+          );
+          continue;
+        }
+        const status = statusRaw.toUpperCase();
         const sizeMatched = Number(orderDetails.size_matched || 0);
         const originalSize = Number(orderDetails.original_size || order.size);
         const clobPrice = Number(orderDetails.price || order.price);
@@ -715,31 +755,44 @@ async function checkAllFills(
         if (previousMatched === null) {
           if (sizeMatched > 0) {
             const verification = verifyFillAgainstChain(chainPositionMap, mm, order, sizeMatched);
-            if (!verification.verified) {
+            if (!verification.verified && verification.reason !== "chain_data_unavailable") {
               console.warn(
                 `[MarketMaking] FILL VERIFICATION FAILED for ${order.orderId}: ${verification.reason}`
               );
-              await prisma.log.create({
-                data: {
-                  level: "WARN",
-                  category: "RECONCILE",
-                  message: "Fill verification failed - CLOB reports fill but chain position mismatch",
-                  metadata: {
-                    orderId: order.orderId,
-                    outcome: order.outcome,
-                    side: order.side,
-                    claimedFillSize: sizeMatched,
-                    reason: verification.reason,
-                    marketSlug: mm.market?.slug,
+                await prisma.log.create({
+                  data: {
+                    level: "WARN",
+                    category: "RECONCILE",
+                    message: "Fill verification failed - CLOB reports fill but chain position mismatch",
+                    metadata: {
+                      orderId: order.orderId,
+                      outcome: order.outcome,
+                      side: order.side,
+                      claimedFillSize: sizeMatched,
+                      reason: verification.reason,
+                      marketSlug: mm.market?.slug,
+                    },
                   },
-                },
-              });
-              // Skip recording this fill - it will be caught by next chain sync if real
-            } else {
-              console.log(
-                `[MarketMaking] Order ${order.orderId} filled before baseline: ${sizeMatched}/${originalSize}`
-              );
-              await processFill(mm, order, result, sizeMatched, false, false);
+                });
+            }
+
+            const recorded = await recordPendingFillEvent({
+              marketMakerId: mm.id,
+              orderId: order.orderId,
+              outcome: order.outcome === "YES" ? "YES" : "NO",
+              side: order.side === "BID" ? "BUY" : "SELL",
+              price: clobPrice,
+              size: sizeMatched,
+              matchedTotal: sizeMatched,
+              source: "poller",
+              metadata: {
+                verification: verification.verified ? "ok" : verification.reason,
+                status,
+                originalSize,
+              },
+            });
+            if (recorded) {
+              result.fillsProcessed++;
             }
           }
 
@@ -768,7 +821,27 @@ async function checkAllFills(
           const deltaMatched = sizeMatched - previousMatched;
           const verification = verifyFillAgainstChain(chainPositionMap, mm, order, deltaMatched);
 
-          if (!verification.verified) {
+          const recorded = await recordPendingFillEvent({
+            marketMakerId: mm.id,
+            orderId: order.orderId,
+            outcome: order.outcome === "YES" ? "YES" : "NO",
+            side: order.side === "BID" ? "BUY" : "SELL",
+            price: clobPrice,
+            size: deltaMatched,
+            matchedTotal: sizeMatched,
+            source: "poller",
+            metadata: {
+              verification: verification.verified ? "ok" : verification.reason,
+              status,
+              originalSize,
+              previousMatched,
+            },
+          });
+          if (recorded) {
+            result.fillsProcessed++;
+          }
+
+          if (!verification.verified && verification.reason !== "chain_data_unavailable") {
             console.warn(
               `[MarketMaking] FILL VERIFICATION FAILED for ${order.orderId}: ${verification.reason}`
             );
@@ -789,7 +862,6 @@ async function checkAllFills(
                 },
               },
             });
-            // Update lastMatchedSize to avoid re-processing, but don't record the fill
             await prisma.marketMakerOrder.updateMany({
               where: { id: order.id },
               data: { lastMatchedSize: sizeMatched },
@@ -798,7 +870,6 @@ async function checkAllFills(
             console.log(
               `[MarketMaking] Order ${order.orderId} filled: ${deltaMatched}/${originalSize} (total ${sizeMatched})`
             );
-            await processFill(mm, order, result, deltaMatched, false, false);
             await prisma.marketMakerOrder.updateMany({
               where: { id: order.id },
               data: { lastMatchedSize: sizeMatched },
@@ -867,7 +938,7 @@ export async function processFill(
   result?: MarketMakingResult,
   filledSize?: number,
   finalizeOrder = true,
-  updateInventory = true
+  updateInventory = false
 ): Promise<void> {
   const isBuy = order.side === "BID";
   const isYes = order.outcome === "YES";
@@ -2310,8 +2381,24 @@ async function processMarketMaker(
         continue;
       }
       const verifiedOrder = verificationResult.order;
-      await prisma.marketMakerOrder.create({
-        data: {
+      await prisma.marketMakerOrder.upsert({
+        where: {
+          marketMakerId_outcome_side_tier: {
+            marketMakerId: mm.id,
+            outcome,
+            side,
+            tier,
+          },
+        },
+        update: {
+          orderId: orderResult.orderId,
+          tokenId: desired.tokenId,
+          price: Number(verifiedOrder.price),
+          size: Number(verifiedOrder.original_size),
+          lastMatchedSize: Number(verifiedOrder.size_matched || 0),
+          verified: true,
+        },
+        create: {
           marketMakerId: mm.id,
           outcome,
           side,
@@ -2524,7 +2611,7 @@ export async function reconcileInventory(
 
     // Get all active market makers with their markets
     const marketMakers = await prisma.marketMaker.findMany({
-      where: { active: true, market: { venue: "POLYMARKET" } },
+      where: { active: true, market: { is: { venue: "POLYMARKET" } } },
       include: { market: true },
     });
 

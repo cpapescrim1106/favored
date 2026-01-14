@@ -1,12 +1,12 @@
 import type {
   OrderRequest,
   OrderResponse,
-  VenueAdapter,
   VenueFill,
   VenueMarket,
   VenueOrderbook,
   VenuePosition,
 } from "../venues/types.js";
+import type { VenueAdapter } from "../venues/adapter.js";
 import { fetchMarket, fetchAllActiveMarkets } from "./gamma.js";
 import {
   getOrderbook,

@@ -43,7 +43,9 @@ function loadPrivateKeyFromEnv(): string | undefined {
     const resolved = path.resolve(keyPath);
     return fs.readFileSync(resolved, "utf8");
   }
-  return process.env.KALSHI_PRIVATE_KEY;
+  const raw = process.env.KALSHI_PRIVATE_KEY;
+  if (!raw) return undefined;
+  return raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
 }
 
 export function getKalshiConfig(): KalshiClientConfig {
@@ -97,7 +99,13 @@ export function createAuthHeaders(method: string, pathWithQuery: string): Record
 
   const timestamp = Date.now().toString();
   const pathOnly = pathWithQuery.split("?")[0];
-  const message = `${timestamp}${method.toUpperCase()}${pathOnly}`;
+  const basePath = new URL(config.baseUrl).pathname.replace(/\/$/, "");
+  const normalizedPath = pathOnly.startsWith("/") ? pathOnly : `/${pathOnly}`;
+  const signedPath =
+    basePath && basePath !== "/" && !normalizedPath.startsWith(basePath)
+      ? `${basePath}${normalizedPath}`
+      : normalizedPath;
+  const message = `${timestamp}${method.toUpperCase()}${signedPath}`;
   const signature = signMessage(config.privateKeyPem, message);
 
   return {

@@ -8,4 +8,13 @@ export const Paths = {
   LOGS: "/logs",
 } as const;
 
+export const ProtectedPaths = [
+  Paths.CANDIDATES,
+  Paths.BASKET,
+  Paths.PORTFOLIO,
+  Paths.MARKET_MAKING,
+  Paths.CONFIG,
+  Paths.LOGS,
+] as const;
+
 export type PathKey = keyof typeof Paths;

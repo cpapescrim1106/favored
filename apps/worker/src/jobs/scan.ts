@@ -1,4 +1,5 @@
 import { prisma } from "../lib/db.js";
+import type { Prisma } from "../../../web/src/generated/prisma/index.js";
 import {
   deriveCategory,
   deriveCategoryFromTags,
@@ -230,12 +231,16 @@ export async function runScanJob(): Promise<void> {
     if (kalshiEnabled) {
       const kalshi = getVenueAdapter("kalshi");
       const kalshiMarkets = await kalshi.listMarkets({
-        status: "active",
+        status: "open",
         limit: Number(process.env.KALSHI_SCAN_LIMIT ?? 1000),
         maxPages: Number(process.env.KALSHI_SCAN_PAGES ?? 3),
       });
 
       console.log(`[Scan] Fetched ${kalshiMarkets.length} Kalshi markets`);
+
+      const kalshiMinLiquidity = Number(
+        process.env.KALSHI_SCAN_MIN_LIQUIDITY ?? minLiquidity
+      );
 
       for (const market of kalshiMarkets) {
         const yesPrice = market.yesPrice ?? null;
@@ -243,7 +248,7 @@ export async function runScanJob(): Promise<void> {
         if (yesPrice === null || noPrice === null) continue;
 
         const liquidityValue = market.liquidity ?? 0;
-        if (minLiquidity && liquidityValue < minLiquidity) continue;
+        if (kalshiMinLiquidity && liquidityValue < kalshiMinLiquidity) continue;
 
         const volume24h = market.volume24h ?? 0;
         const endDate = market.closeTime ? new Date(market.closeTime) : null;
@@ -277,7 +282,9 @@ export async function runScanJob(): Promise<void> {
             liquidity: liquidityValue,
             volume24h,
             priceLevelStructure: market.priceLevelStructure ?? null,
-            priceRanges: market.priceRanges ?? null,
+            priceRanges: market.priceRanges
+              ? (market.priceRanges as unknown as Prisma.InputJsonValue)
+              : undefined,
             clobTokenIds: [],
             lastUpdated: new Date(),
           },
@@ -296,7 +303,9 @@ export async function runScanJob(): Promise<void> {
             liquidity: liquidityValue,
             volume24h,
             priceLevelStructure: market.priceLevelStructure ?? null,
-            priceRanges: market.priceRanges ?? null,
+            priceRanges: market.priceRanges
+              ? (market.priceRanges as unknown as Prisma.InputJsonValue)
+              : undefined,
             clobTokenIds: [],
             lastUpdated: new Date(),
           },
@@ -320,7 +329,7 @@ export async function runScanJob(): Promise<void> {
             minProb: Number(config.minProb),
             maxProb: Number(config.maxProb),
             maxSpread: Number(config.maxSpread),
-            minLiquidity: Number(config.minLiquidity),
+            minLiquidity: kalshiMinLiquidity,
           });
 
           if (result.eligible) {

@@ -55,10 +55,15 @@ export async function subscribeKalshiOrderbook(
 
   const stateByTicker = new Map<string, OrderbookState>();
 
-  const socket = new WebSocket(
+  type WebSocketWithHeaders = new (
+    url: string,
+    protocols?: string | string[] | { headers?: Record<string, string> }
+  ) => WebSocket;
+  const WsCtor = WebSocket as unknown as WebSocketWithHeaders;
+  const socket = new WsCtor(
     config.wsUrl,
-    headers ? ({ headers } as unknown as WebSocket) : undefined
-  ); // TS lib doesn't include ws headers typing
+    headers ? { headers } : undefined
+  );
 
   let open = false;
 

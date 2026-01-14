@@ -9,7 +9,7 @@ import type {
   AppRouteHandlerFnContext,
   NextAuthRequest,
 } from "@/lib/types/api";
-import type { Session } from "next-auth";
+import type { Session } from "@/auth";
 import type { NextResponse } from "next/server";
 
 export type AuthorizeCallback = (
@@ -38,11 +38,11 @@ function apiWithAuth(
     context: AppRouteHandlerFnContext,
   ) => Promise<NextResponse>,
 ) {
-  return auth(async (request, context) => {
+  return auth(async (request: NextAuthRequest, context) => {
     try {
       if (!request.auth) {
         return options.onUnauthorized
-          ? await options.onUnauthorized(request)
+          ? await options.onUnauthorized(request as NextAuthRequest)
           : unauthorized();
       }
 
@@ -53,7 +53,7 @@ function apiWithAuth(
           : [options.roles];
         if (!roleList.includes(request.auth.user.role)) {
           return options.onForbidden
-            ? await options.onForbidden(request)
+            ? await options.onForbidden(request as NextAuthRequest)
             : forbidden();
         }
       }
@@ -67,7 +67,7 @@ function apiWithAuth(
         );
         if (!isAuthorized) {
           return options.onForbidden
-            ? await options.onForbidden(request)
+            ? await options.onForbidden(request as NextAuthRequest)
             : forbidden();
         }
       }

@@ -1,6 +1,6 @@
 import { auth } from "@/auth";
 import type { Role } from "@/generated/prisma/client";
-import type { Session } from "next-auth";
+import type { Session } from "@/auth";
 import type { ActionReturn } from "./types/action";
 
 export function actionWithAuth<

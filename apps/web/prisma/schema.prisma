@@ -252,6 +252,7 @@ model MarketMaker {
   // Relations
   orders       MarketMakerOrder[]
   fills        MarketMakerFill[]
+  fillEvents   MarketMakerFillEvent[]
   quoteHistory QuoteHistory[]
 
   @@index([active])
@@ -306,6 +307,32 @@ model MarketMakerFill {
   @@index([marketMakerId])
   @@index([filledAt])
   @@map("market_maker_fills")
+}
+
+/// Pending/confirmed fill events (on-chain validated)
+model MarketMakerFillEvent {
+  id            String      @id @default(cuid())
+  marketMakerId String
+  marketMaker   MarketMaker @relation(fields: [marketMakerId], references: [id], onDelete: Cascade)
+
+  outcome     String // "YES" or "NO"
+  side        String // "BUY" or "SELL"
+  orderId     String // CLOB order ID
+  price       Decimal @db.Decimal(10, 6)
+  size        Decimal @db.Decimal(18, 6) // Remaining size to confirm
+  value       Decimal @db.Decimal(18, 6) // price * size
+  matchedTotal Decimal @db.Decimal(18, 6) // CLOB cumulative matched size when observed
+  source      String? // "poller", "ws", "sync"
+  status      String  @default("PENDING") // "PENDING", "CONFIRMED", "REJECTED"
+  metadata    Json?
+
+  observedAt  DateTime @default(now())
+  confirmedAt DateTime?
+
+  @@unique([orderId, matchedTotal])
+  @@index([marketMakerId, status])
+  @@index([observedAt])
+  @@map("market_maker_fill_events")
 }
 
 /// Audit trail of quote updates and state changes

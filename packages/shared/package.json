@@ -22,6 +22,14 @@
       "types": "./dist/scoring/index.d.ts",
       "import": "./dist/scoring/index.js"
     },
+    "./market-making": {
+      "types": "./dist/market-making/index.d.ts",
+      "import": "./dist/market-making/index.js"
+    },
+    "./mm-screening": {
+      "types": "./dist/mm-screening/index.d.ts",
+      "import": "./dist/mm-screening/index.js"
+    },
     "./risk": {
       "types": "./dist/risk/index.d.ts",
       "import": "./dist/risk/index.js"

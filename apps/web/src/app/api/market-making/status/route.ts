@@ -9,6 +9,8 @@ import {
   getVenueAdapter,
   isKalshiConfigured,
   registerDefaultVenues,
+  type OrderResponse,
+  type VenuePosition,
 } from "@favored/shared";
 
 const STATUS_STALE_MS = Number(process.env.MM_STATUS_STALE_MS ?? 120000);
@@ -19,6 +21,18 @@ type CheckResult<T> = {
   value?: T;
   error?: string;
 };
+
+type KalshiBalance = {
+  balance: number;
+  portfolioValue: number;
+  updatedTs: number;
+};
+
+const notConfiguredCheck = <T>(): CheckResult<T> => ({
+  ok: false,
+  durationMs: 0,
+  error: "not_configured",
+});
 
 async function timedCheck<T>(
   fn: () => Promise<T | null>
@@ -75,9 +89,15 @@ export async function GET() {
       timedCheck(() => getBalance()),
       timedCheck(() => fetchActiveOrders()),
       timedCheck(() => getPositions(undefined, { sizeThreshold: 0, limit: 500 })),
-      kalshiConfigured ? timedCheck(() => getKalshiBalance()) : Promise.resolve({ ok: false, durationMs: 0, error: "not_configured" }),
-      kalshiAdapter ? timedCheck(() => kalshiAdapter.getOpenOrders()) : Promise.resolve({ ok: false, durationMs: 0, error: "not_configured" }),
-      kalshiAdapter ? timedCheck(() => kalshiAdapter.getPositions()) : Promise.resolve({ ok: false, durationMs: 0, error: "not_configured" }),
+      kalshiConfigured
+        ? timedCheck<KalshiBalance>(() => getKalshiBalance())
+        : notConfiguredCheck<KalshiBalance>(),
+      kalshiAdapter
+        ? timedCheck<OrderResponse[]>(() => kalshiAdapter.getOpenOrders())
+        : notConfiguredCheck<OrderResponse[]>(),
+      kalshiAdapter
+        ? timedCheck<VenuePosition[]>(() => kalshiAdapter.getPositions())
+        : notConfiguredCheck<VenuePosition[]>(),
     ]);
 
     const now = Date.now();

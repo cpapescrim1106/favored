@@ -11,7 +11,7 @@ import { startClobUserWs, stopClobUserWs } from "./ws/clob-user.js";
 const SCAN_INTERVAL = process.env.SCAN_INTERVAL || "*/10 * * * *"; // Every 10 minutes
 const MM_INTERVAL = process.env.MM_INTERVAL || "*/5 * * * * *"; // Every 5 seconds
 const SYNC_INTERVAL = process.env.SYNC_INTERVAL || "0 * * * *"; // Every hour (sync is now alert-only)
-const INVENTORY_SYNC_INTERVAL = process.env.INVENTORY_SYNC_INTERVAL || "*/30 * * * * *"; // Every 30 seconds
+const INVENTORY_SYNC_INTERVAL = process.env.INVENTORY_SYNC_INTERVAL || "*/10 * * * * *"; // Every 10 seconds
 
 async function main() {
   console.log("[Worker] Starting Favored worker service...");

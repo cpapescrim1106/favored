@@ -442,7 +442,8 @@ async function syncOrders(
               await recordFill(
                 dbOrder.marketMaker.id,
                 dbOrder,
-                sizeMatched - lastMatched
+                sizeMatched - lastMatched,
+                sizeMatched
               );
             }
           }
@@ -574,77 +575,34 @@ async function recordFill(
     side: string;
     price: unknown;
   },
-  fillSize: number
+  fillSize: number,
+  matchedTotal: number
 ): Promise<void> {
-  const isBuy = order.side === "BID";
-  const isYes = order.outcome === "YES";
   const price = Number(order.price);
-  const value = price * fillSize;
-
-  // Get current MM state
-  const mm = await prisma.marketMaker.findUnique({
-    where: { id: marketMakerId },
+  const side = order.side === "BID" ? "BUY" : "SELL";
+  const existing = await prisma.marketMakerFillEvent.findUnique({
+    where: {
+      orderId_matchedTotal: {
+        orderId: order.orderId,
+        matchedTotal,
+      },
+    },
+    select: { id: true },
   });
-  if (!mm) return;
+  if (existing) return;
 
-  let yesInventory = Number(mm.yesInventory);
-  let noInventory = Number(mm.noInventory);
-  let avgYesCost = Number(mm.avgYesCost);
-  let avgNoCost = Number(mm.avgNoCost);
-  let realizedPnl = Number(mm.realizedPnl);
-  let fillRealizedPnl: number | null = null;
-
-  if (isYes) {
-    if (isBuy) {
-      const totalCost = avgYesCost * yesInventory + value;
-      yesInventory += fillSize;
-      avgYesCost = yesInventory > 0 ? totalCost / yesInventory : 0;
-    } else {
-      if (yesInventory > 0) {
-        fillRealizedPnl = (price - avgYesCost) * fillSize;
-        realizedPnl += fillRealizedPnl;
-      }
-      yesInventory = Math.max(0, yesInventory - fillSize);
-      if (yesInventory <= 0) avgYesCost = 0;
-    }
-  } else {
-    if (isBuy) {
-      const totalCost = avgNoCost * noInventory + value;
-      noInventory += fillSize;
-      avgNoCost = noInventory > 0 ? totalCost / noInventory : 0;
-    } else {
-      if (noInventory > 0) {
-        fillRealizedPnl = (price - avgNoCost) * fillSize;
-        realizedPnl += fillRealizedPnl;
-      }
-      noInventory = Math.max(0, noInventory - fillSize);
-      if (noInventory <= 0) avgNoCost = 0;
-    }
-  }
-
-  // Record the fill
-  await prisma.marketMakerFill.create({
+  await prisma.marketMakerFillEvent.create({
     data: {
       marketMakerId,
       outcome: order.outcome,
-      side: isBuy ? "BUY" : "SELL",
+      side,
       orderId: order.orderId,
       price,
       size: fillSize,
-      value,
-      realizedPnl: fillRealizedPnl,
-    },
-  });
-
-  // Update MM state
-  await prisma.marketMaker.update({
-    where: { id: marketMakerId },
-    data: {
-      yesInventory,
-      noInventory,
-      avgYesCost,
-      avgNoCost,
-      realizedPnl,
+      value: price * fillSize,
+      matchedTotal,
+      source: "api_sync",
+      metadata: { reason: "unrecorded_fill" },
     },
   });
 }
