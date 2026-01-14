@@ -1,6 +1,6 @@
 import { prisma } from "@/lib/db";
 import { NextRequest, NextResponse } from "next/server";
-import { cancelOrder } from "@favored/shared";
+import { getVenueAdapter, registerDefaultVenues } from "@favored/shared";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -232,6 +232,7 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
         market: {
           select: {
             slug: true,
+            venue: true,
           },
         },
         orders: true,
@@ -246,10 +247,14 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     }
 
     // Cancel any open orders
+    registerDefaultVenues();
+    const adapter = getVenueAdapter(
+      marketMaker.market?.venue === "KALSHI" ? "kalshi" : "polymarket"
+    );
     let cancelledCount = 0;
     for (const order of marketMaker.orders) {
       try {
-        await cancelOrder(order.orderId);
+        await adapter.cancelOrder(order.orderId, order.clientOrderId ?? undefined);
         cancelledCount++;
       } catch (e) {
         console.error(`Failed to cancel order ${order.orderId}:`, e);

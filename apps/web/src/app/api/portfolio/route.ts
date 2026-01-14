@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
-import { getBalance, getPositions, type DataAPIPosition } from "@favored/shared/polymarket";
+import {
+  getBalance,
+  getPositions,
+  getKalshiBalance,
+  type DataAPIPosition,
+} from "@favored/shared";
 
 /**
  * GET /api/portfolio
@@ -17,14 +22,31 @@ export async function GET() {
       );
     }
 
-    // Fetch cash balance
+    // Fetch cash balances
+    const cashByVenue: { polymarket: number | null; kalshi: number | null } = {
+      polymarket: null,
+      kalshi: null,
+    };
+
     let cashBalance = 0;
     try {
       const balanceData = await getBalance();
-      cashBalance = balanceData?.balance ?? 0;
+      cashByVenue.polymarket = balanceData?.balance ?? null;
     } catch {
       // Silently fail - will show 0
     }
+
+    try {
+      const kalshiBalance = await getKalshiBalance();
+      cashByVenue.kalshi = kalshiBalance?.balance ?? null;
+    } catch {
+      // Silently fail - will show 0
+    }
+
+    const cashValues = Object.values(cashByVenue).filter(
+      (value): value is number => typeof value === "number"
+    );
+    cashBalance = cashValues.length > 0 ? cashValues.reduce((sum, v) => sum + v, 0) : 0;
 
     // Separate open positions from resolved (redeemable) ones
     const openPositions: DataAPIPosition[] = [];
@@ -91,6 +113,16 @@ export async function GET() {
     return NextResponse.json({
       positions: serialized,
       cashBalance: Math.round(cashBalance * 100) / 100,
+      cashByVenue: {
+        polymarket:
+          cashByVenue.polymarket !== null
+            ? Math.round(cashByVenue.polymarket * 100) / 100
+            : null,
+        kalshi:
+          cashByVenue.kalshi !== null
+            ? Math.round(cashByVenue.kalshi * 100) / 100
+            : null,
+      },
       summary: {
         totalCost: Math.round(totalCost * 100) / 100,
         totalValue: Math.round(totalValue * 100) / 100,

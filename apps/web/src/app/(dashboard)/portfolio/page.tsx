@@ -80,6 +80,20 @@ export default function PortfolioPage() {
 
   // Cash balance (USDC in wallet) - now included in portfolio response
   const cashBalance = data?.cashBalance ?? 0;
+  const cashByVenue = data?.cashByVenue || {
+    polymarket: null,
+    kalshi: null,
+  };
+  const cashBreakdown = [
+    cashByVenue.polymarket !== null
+      ? `Poly $${cashByVenue.polymarket.toFixed(0)}`
+      : null,
+    cashByVenue.kalshi !== null
+      ? `Kalshi $${cashByVenue.kalshi.toFixed(0)}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   // Combined metrics
   const totalPnl = summary.unrealizedPnl + closedSummary.realizedPnl;
@@ -118,6 +132,9 @@ export default function PortfolioPage() {
           <div className="text-xs text-zinc-500 uppercase">Cash</div>
           <div className="text-2xl font-bold">
             ${cashBalance.toFixed(2)}
+          </div>
+          <div className="text-xs text-zinc-500 mt-1">
+            {cashBreakdown || "—"}
           </div>
         </div>
         <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">

@@ -1,6 +1,6 @@
 import { prisma } from "@/lib/db";
 import { NextRequest, NextResponse } from "next/server";
-import { getBalance, getBestPrices } from "@favored/shared";
+import { getBalance, getBestPrices, getKalshiBalance } from "@favored/shared";
 
 /**
  * GET /api/market-making
@@ -24,6 +24,7 @@ export async function GET() {
             noPrice: true,
             endDate: true,
             clobTokenIds: true,
+            venue: true,
           },
         },
         orders: true,
@@ -122,14 +123,36 @@ export async function GET() {
       return sum + netRisk;
     }, 0);
 
-    // Fetch cash balance
-    let cashAvailable: number | null = null;
+    // Fetch cash balances by venue
+    const cashAvailableByVenue: {
+      polymarket: number | null;
+      kalshi: number | null;
+    } = {
+      polymarket: null,
+      kalshi: null,
+    };
+
     try {
       const balanceData = await getBalance();
-      cashAvailable = balanceData?.balance ?? null;
+      cashAvailableByVenue.polymarket = balanceData?.balance ?? null;
     } catch (e) {
       // Silently fail - will show "—" in UI
     }
+
+    try {
+      const kalshiBalance = await getKalshiBalance();
+      cashAvailableByVenue.kalshi = kalshiBalance?.balance ?? null;
+    } catch (e) {
+      // Silently fail - will show "—" in UI
+    }
+
+    const cashAvailableValues = Object.values(cashAvailableByVenue).filter(
+      (value): value is number => typeof value === "number"
+    );
+    const cashAvailable =
+      cashAvailableValues.length > 0
+        ? cashAvailableValues.reduce((sum, value) => sum + value, 0)
+        : null;
 
     const bestBidResults = await Promise.all(
       marketMakers.map(async (mm) => {
@@ -167,6 +190,7 @@ export async function GET() {
         totalPnl: totalRealizedPnl + totalUnrealizedPnl,
         totalAtRisk,
         cashAvailable,
+        cashAvailableByVenue,
       },
       marketMakers: marketMakers.map((mm, index) => ({
         id: mm.id,
@@ -181,6 +205,7 @@ export async function GET() {
               yesBestBid: bestBidResults[index]?.yesBestBid ?? null,
               noBestBid: bestBidResults[index]?.noBestBid ?? null,
               endDate: mm.market.endDate?.toISOString() || null,
+              venue: mm.market.venue,
             }
           : null,
         active: mm.active,

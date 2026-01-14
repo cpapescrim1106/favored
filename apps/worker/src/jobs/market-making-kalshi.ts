@@ -1,4 +1,5 @@
 import { prisma } from "../lib/db.js";
+import crypto from "crypto";
 import {
   calculateQuotes,
   calculateMidPrice,
@@ -14,6 +15,12 @@ import {
 import { addHours, isBefore } from "date-fns";
 
 const MIN_QUOTE_INTERVAL = 5000;
+const ORDER_GROUP_ID = process.env.KALSHI_ORDER_GROUP_ID;
+
+const buildClientOrderId = (seed: string): string => {
+  const digest = crypto.createHash("sha256").update(seed).digest("hex").slice(0, 24);
+  return `mm-${digest}`;
+};
 
 export interface KalshiMarketMakingResult {
   processed: number;
@@ -219,6 +226,9 @@ export async function runKalshiMarketMakingJob(): Promise<KalshiMarketMakingResu
         result.quotesCancelled += 1;
       }
 
+      const clientOrderId = buildClientOrderId(
+        `${mm.id}:${desired.outcome}:${desired.side}:${price.toFixed(4)}:${size.toFixed(4)}`
+      );
       const orderResult = await adapter.placeOrder({
         venue: "kalshi",
         venueMarketId: mm.marketId,
@@ -228,6 +238,8 @@ export async function runKalshiMarketMakingJob(): Promise<KalshiMarketMakingResu
         size,
         postOnly: true,
         reduceOnly: desired.quote.reduceOnly,
+        clientOrderId,
+        orderGroupId: ORDER_GROUP_ID,
       });
 
       if (!orderResult.success || !orderResult.orderId) {
@@ -246,6 +258,8 @@ export async function runKalshiMarketMakingJob(): Promise<KalshiMarketMakingResu
         },
         update: {
           orderId: orderResult.orderId,
+          clientOrderId,
+          orderGroupId: ORDER_GROUP_ID,
           tokenId: mm.marketId,
           price,
           size,
@@ -258,6 +272,8 @@ export async function runKalshiMarketMakingJob(): Promise<KalshiMarketMakingResu
           side: desired.side,
           tier: 0,
           orderId: orderResult.orderId,
+          clientOrderId,
+          orderGroupId: ORDER_GROUP_ID,
           tokenId: mm.marketId,
           price,
           size,

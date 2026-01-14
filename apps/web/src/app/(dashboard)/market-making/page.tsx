@@ -71,6 +71,7 @@ interface MarketMaker {
     yesBestBid: number | null;
     noBestBid: number | null;
     endDate: string | null;
+    venue: "POLYMARKET" | "KALSHI";
   } | null;
   active: boolean;
   paused: boolean;
@@ -122,6 +123,10 @@ interface MarketMakingData {
     totalPnl: number;
     totalAtRisk: number;
     cashAvailable: number | null;
+    cashAvailableByVenue?: {
+      polymarket: number | null;
+      kalshi: number | null;
+    };
   };
   marketMakers: MarketMaker[];
 }
@@ -404,7 +409,26 @@ export default function MarketMakingPage() {
     totalPnl: 0,
     totalAtRisk: 0,
     cashAvailable: null,
+    cashAvailableByVenue: {
+      polymarket: null,
+      kalshi: null,
+    },
   };
+
+  const cashByVenue = summary.cashAvailableByVenue ?? {
+    polymarket: null,
+    kalshi: null,
+  };
+  const cashBreakdown = [
+    cashByVenue.polymarket !== null
+      ? `Poly $${cashByVenue.polymarket.toFixed(0)}`
+      : null,
+    cashByVenue.kalshi !== null
+      ? `Kalshi $${cashByVenue.kalshi.toFixed(0)}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const fillsAll = fillsData?.fills || [];
   const fillsTotalCount = fillsData?.count ?? null;
   const fillsCountLabel = fillsTotalCount === null ? "—" : fillsTotalCount;
@@ -1067,6 +1091,9 @@ export default function MarketMakingPage() {
                 ? `$${summary.cashAvailable >= 1000 ? `${(summary.cashAvailable / 1000).toFixed(1)}k` : summary.cashAvailable.toFixed(0)}`
                 : "—"}
             </div>
+            <div className="text-xs text-zinc-500 mt-1">
+              {cashBreakdown || "—"}
+            </div>
           </div>
           <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
             <div className="text-xs text-zinc-500 uppercase">Net Risk</div>
@@ -1301,16 +1328,27 @@ export default function MarketMakingPage() {
                     </TableCell>
                     <TableCell className="font-medium">
                       <div>
-                        <a
-                          href={`https://polymarket.com/market/${mm.market?.slug}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="hover:underline line-clamp-1"
-                          title={mm.market?.question}
-                        >
-                          {mm.market?.question || mm.marketId.slice(0, 16) + "..."}
-                        </a>
+                        {mm.market?.venue === "POLYMARKET" ? (
+                          <a
+                            href={`https://polymarket.com/market/${mm.market?.slug}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="hover:underline line-clamp-1"
+                            title={mm.market?.question}
+                          >
+                            {mm.market?.question || mm.marketId.slice(0, 16) + "..."}
+                          </a>
+                        ) : (
+                          <span className="line-clamp-1" title={mm.market?.question}>
+                            {mm.market?.question || mm.marketId.slice(0, 16) + "..."}
+                          </span>
+                        )}
                         <div className="text-xs text-zinc-500 flex items-center gap-1">
+                          {mm.market?.venue && (
+                            <Badge variant="outline" className="text-[10px] px-1 py-0">
+                              {mm.market.venue === "POLYMARKET" ? "Poly" : "Kalshi"}
+                            </Badge>
+                          )}
                           {mm.market?.category || "—"}
                           <span className="text-zinc-400">·</span>
                           <span>

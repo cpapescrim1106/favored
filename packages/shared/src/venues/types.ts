@@ -58,6 +58,7 @@ export interface OrderRequest {
   postOnly?: boolean;
   reduceOnly?: boolean;
   clientOrderId?: string;
+  orderGroupId?: string;
   timeInForce?: "GTC" | "IOC" | "FOK";
 }
 

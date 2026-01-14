@@ -133,3 +133,9 @@ export interface KalshiFillsResponse {
 export interface KalshiOrderGroupResponse {
   order_group_id: string;
 }
+
+export interface KalshiBalanceResponse {
+  balance: number;
+  portfolio_value: number;
+  updated_ts: number;
+}

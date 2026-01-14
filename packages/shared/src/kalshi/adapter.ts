@@ -8,7 +8,7 @@ import type {
   VenuePosition,
 } from "../venues/types.js";
 import { clampPrice, quantizePrice } from "../venues/price.js";
-import { kalshiRequest, parseFixedPoint } from "./client.js";
+import { getKalshiSubaccount, kalshiRequest, parseFixedPoint } from "./client.js";
 import { normalizeKalshiOrderbook } from "./normalize.js";
 import { subscribeKalshiOrderbook } from "./ws.js";
 import type {
@@ -136,6 +136,7 @@ function buildOrderRequest(
     type: "limit",
     post_only: request.postOnly ?? true,
     reduce_only: request.reduceOnly ?? false,
+    order_group_id: request.orderGroupId,
     yes_price: translated.side === "yes" ? translated.yes_price : undefined,
     no_price: translated.side === "no" ? translated.no_price : undefined,
   };
@@ -287,10 +288,14 @@ export class KalshiAdapter implements VenueAdapter {
   }
 
   async getOpenOrders(venueMarketId?: string): Promise<OrderResponse[]> {
+    const subaccount = getKalshiSubaccount();
     const response = await kalshiRequest<KalshiOrdersResponse>({
       method: "GET",
       path: "/portfolio/orders",
-      query: venueMarketId ? { ticker: venueMarketId } : undefined,
+      query: {
+        ...(venueMarketId ? { ticker: venueMarketId } : {}),
+        ...(subaccount !== undefined ? { subaccount } : {}),
+      },
       auth: true,
     });
 
@@ -303,9 +308,11 @@ export class KalshiAdapter implements VenueAdapter {
   }
 
   async getPositions(): Promise<VenuePosition[]> {
+    const subaccount = getKalshiSubaccount();
     const response = await kalshiRequest<KalshiPositionsResponse>({
       method: "GET",
       path: "/portfolio/positions",
+      query: subaccount !== undefined ? { subaccount } : undefined,
       auth: true,
     });
 
@@ -334,6 +341,10 @@ export class KalshiAdapter implements VenueAdapter {
     const query: Record<string, string | number> = {};
     if (params?.sinceTs) {
       query.since_ts = params.sinceTs;
+    }
+    const subaccount = getKalshiSubaccount();
+    if (subaccount !== undefined) {
+      query.subaccount = subaccount;
     }
 
     const response = await kalshiRequest<KalshiFillsResponse>({
