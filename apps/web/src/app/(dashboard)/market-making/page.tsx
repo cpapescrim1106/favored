@@ -50,6 +50,7 @@ import {
 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { SyncStatus } from "@/components/sync-status";
+import { MarketMakingStatus } from "@/components/mm-status";
 
 interface MarketMakerOrder {
   outcome: string;
@@ -189,6 +190,7 @@ export default function MarketMakingPage() {
   const [selectedCandidate, setSelectedCandidate] = useState<MMCandidate | null>(null);
   const [dialogStep, setDialogStep] = useState<"select" | "configure">("select");
   const [pnlWindow, setPnlWindow] = useState<"24h" | "1w" | "all">("24h");
+  const [venueFilter, setVenueFilter] = useState<"all" | "POLYMARKET" | "KALSHI">("all");
   const [bulkDialogOpen, setBulkDialogOpen] = useState(false);
   const [bulkApplyToAll, setBulkApplyToAll] = useState(false);
   const [fillsOpen, setFillsOpen] = useState(false);
@@ -435,15 +437,20 @@ export default function MarketMakingPage() {
   const marketMakers = data?.marketMakers || [];
   const mmEnabled = data?.mmEnabled || false;
   const candidates = candidatesData?.candidates || [];
-  const totalDeployed = marketMakers.reduce((sum, mm) => {
+  const marketMakerOrder = new Map(
+    marketMakers.map((mm, index) => [mm.id, index])
+  );
+  const filteredMarketMakers = marketMakers.filter((mm) => {
+    const venue = mm.market?.venue ?? "POLYMARKET";
+    if (venueFilter === "all") return true;
+    return venue === venueFilter;
+  });
+  const totalDeployed = filteredMarketMakers.reduce((sum, mm) => {
     const yesCost = mm.yesInventory * mm.avgYesCost;
     const noCost = mm.noInventory * mm.avgNoCost;
     return sum + yesCost + noCost;
   }, 0);
-  const marketMakerOrder = new Map(
-    marketMakers.map((mm, index) => [mm.id, index])
-  );
-  const sortedMarketMakers = [...marketMakers].sort((a, b) => {
+  const sortedMarketMakers = [...filteredMarketMakers].sort((a, b) => {
     const aHasInventory =
       Math.abs(a.yesInventory) > 0.0001 || Math.abs(a.noInventory) > 0.0001;
     const bHasInventory =
@@ -456,7 +463,54 @@ export default function MarketMakingPage() {
   const selectedMarketIdSet = new Set(selectedMarketIds);
   const hasSelections = selectedMarketIds.length > 0;
   const allSelected =
-    marketMakers.length > 0 && selectedMarketIds.length === marketMakers.length;
+    sortedMarketMakers.length > 0 &&
+    sortedMarketMakers.every((mm) => selectedMarketIdSet.has(mm.id));
+  const filteredActiveCount = sortedMarketMakers.filter(
+    (mm) => mm.active && !mm.paused
+  ).length;
+  const computedSummary = sortedMarketMakers.reduce(
+    (acc, mm) => {
+      acc.totalRealizedPnl += mm.realizedPnl;
+      acc.totalUnrealizedPnl += mm.unrealizedPnl;
+
+      const maxInv = mm.maxInventory;
+      const yesInvRatio = maxInv > 0 ? mm.yesInventory / maxInv : 0;
+      const noInvRatio = maxInv > 0 ? mm.noInventory / maxInv : 0;
+      const nearMaxInventory = yesInvRatio > 0.8 || noInvRatio > 0.8;
+      const volatilityPaused = mm.volatilityPauseUntil
+        ? new Date(mm.volatilityPauseUntil) > new Date()
+        : false;
+      if (nearMaxInventory || volatilityPaused) {
+        acc.marketsAtRisk += 1;
+      }
+
+      const yesCost = mm.yesInventory * mm.avgYesCost;
+      const noCost = mm.noInventory * mm.avgNoCost;
+      const totalCost = yesCost + noCost;
+      const minShares = Math.min(mm.yesInventory, mm.noInventory);
+      const netRisk = Math.max(0, totalCost - minShares);
+      acc.totalAtRisk += netRisk;
+      return acc;
+    },
+    { totalRealizedPnl: 0, totalUnrealizedPnl: 0, totalAtRisk: 0, marketsAtRisk: 0 }
+  );
+  const summaryView =
+    venueFilter === "all"
+      ? summary
+      : {
+          ...summary,
+          totalRealizedPnl: computedSummary.totalRealizedPnl,
+          totalUnrealizedPnl: computedSummary.totalUnrealizedPnl,
+          totalPnl: computedSummary.totalRealizedPnl + computedSummary.totalUnrealizedPnl,
+          totalAtRisk: computedSummary.totalAtRisk,
+          marketsAtRisk: computedSummary.marketsAtRisk,
+        };
+  const cashAvailableView =
+    venueFilter === "POLYMARKET"
+      ? cashByVenue.polymarket
+      : venueFilter === "KALSHI"
+      ? cashByVenue.kalshi
+      : summary.cashAvailable;
 
   // Helper to get order by outcome and side
   const getOrder = (mm: MarketMaker, outcome: string, side: string) => {
@@ -474,7 +528,7 @@ export default function MarketMakingPage() {
 
   const toggleSelectAll = (checked: boolean) => {
     if (checked) {
-      setSelectedMarketIds(marketMakers.map((mm) => mm.id));
+      setSelectedMarketIds(sortedMarketMakers.map((mm) => mm.id));
     } else {
       setSelectedMarketIds([]);
     }
@@ -535,8 +589,8 @@ export default function MarketMakingPage() {
   };
   const windowPnlTotal =
     pnlWindow === "all"
-      ? summary.totalPnl
-      : marketMakers.reduce((sum, mm) => sum + getWindowPnl(mm), 0);
+      ? summaryView.totalPnl
+      : sortedMarketMakers.reduce((sum, mm) => sum + getWindowPnl(mm), 0);
 
   return (
     <div className="space-y-4">
@@ -548,7 +602,8 @@ export default function MarketMakingPage() {
             Market Making
           </h1>
           <p className="text-sm text-zinc-500">
-            {summary.active} active of {summary.total} configured
+            {venueFilter === "all" ? summary.active : filteredActiveCount} active of{" "}
+            {venueFilter === "all" ? summary.total : sortedMarketMakers.length} configured
           </p>
         </div>
         <div className="flex items-center gap-4">
@@ -574,6 +629,29 @@ export default function MarketMakingPage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <span className="text-xs text-zinc-500 uppercase">Venue</span>
+            <div className="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1">
+              {[
+                { value: "all", label: "All" },
+                { value: "POLYMARKET", label: "Poly" },
+                { value: "KALSHI", label: "Kalshi" },
+              ].map((option) => (
+                <Button
+                  key={option.value}
+                  type="button"
+                  variant={venueFilter === option.value ? "secondary" : "ghost"}
+                  size="sm"
+                  className="h-7 px-2"
+                  onClick={() =>
+                    setVenueFilter(option.value as "all" | "POLYMARKET" | "KALSHI")
+                  }
+                >
+                  {option.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
             <Label htmlFor="mm-enabled" className="text-sm">
               MM Enabled
             </Label>
@@ -584,6 +662,7 @@ export default function MarketMakingPage() {
               disabled={toggleMM.isPending}
             />
           </div>
+          <MarketMakingStatus />
           <SyncStatus />
           <Button
             variant="outline"
@@ -1087,8 +1166,8 @@ export default function MarketMakingPage() {
           <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
             <div className="text-xs text-zinc-500 uppercase">Cash Available</div>
             <div className="text-2xl font-bold">
-              {summary.cashAvailable !== null
-                ? `$${summary.cashAvailable >= 1000 ? `${(summary.cashAvailable / 1000).toFixed(1)}k` : summary.cashAvailable.toFixed(0)}`
+              {cashAvailableView !== null
+                ? `$${cashAvailableView >= 1000 ? `${(cashAvailableView / 1000).toFixed(1)}k` : cashAvailableView.toFixed(0)}`
                 : "—"}
             </div>
             <div className="text-xs text-zinc-500 mt-1">
@@ -1097,11 +1176,11 @@ export default function MarketMakingPage() {
           </div>
           <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
             <div className="text-xs text-zinc-500 uppercase">Net Risk</div>
-            <div className={`text-2xl font-bold ${summary.totalAtRisk > 0 ? "text-amber-600" : ""}`}>
-              ${summary.totalAtRisk >= 1000 ? `${(summary.totalAtRisk / 1000).toFixed(1)}k` : summary.totalAtRisk.toFixed(0)}
+            <div className={`text-2xl font-bold ${summaryView.totalAtRisk > 0 ? "text-amber-600" : ""}`}>
+              ${summaryView.totalAtRisk >= 1000 ? `${(summaryView.totalAtRisk / 1000).toFixed(1)}k` : summaryView.totalAtRisk.toFixed(0)}
             </div>
             <div className="text-xs text-zinc-500 mt-1">
-              {summary.marketsAtRisk > 0 && `${summary.marketsAtRisk} near max inv`}
+              {summaryView.marketsAtRisk > 0 && `${summaryView.marketsAtRisk} near max inv`}
             </div>
           </div>
           <div className="p-4 bg-zinc-100 dark:bg-zinc-900 rounded-lg">
@@ -1129,12 +1208,12 @@ export default function MarketMakingPage() {
             <div className="text-xs text-zinc-500 mt-1">
               {pnlWindow === "all" ? (
                 <>
-                  <span className={summary.totalRealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
-                    ${summary.totalRealizedPnl >= 0 ? "+" : ""}{summary.totalRealizedPnl.toFixed(2)} real
+                  <span className={summaryView.totalRealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
+                    ${summaryView.totalRealizedPnl >= 0 ? "+" : ""}{summaryView.totalRealizedPnl.toFixed(2)} real
                   </span>
                   {" / "}
-                  <span className={summary.totalUnrealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
-                    ${summary.totalUnrealizedPnl >= 0 ? "+" : ""}{summary.totalUnrealizedPnl.toFixed(2)} unreal
+                  <span className={summaryView.totalUnrealizedPnl >= 0 ? "text-green-600/70" : "text-red-600/70"}>
+                    ${summaryView.totalUnrealizedPnl >= 0 ? "+" : ""}{summaryView.totalUnrealizedPnl.toFixed(2)} unreal
                   </span>
                 </>
               ) : (
@@ -1277,15 +1356,24 @@ export default function MarketMakingPage() {
                   </TableCell>
                 </TableRow>
               ))
-            ) : marketMakers.length === 0 ? (
+            ) : sortedMarketMakers.length === 0 ? (
               <TableRow>
                 <TableCell
                   colSpan={14}
                   className="text-center py-12 text-zinc-500"
                 >
                   <BarChart3 className="h-12 w-12 mx-auto mb-2 opacity-20" />
-                  <p>No market makers configured</p>
-                  <p className="text-sm">Add a market to start making</p>
+                  {marketMakers.length > 0 ? (
+                    <>
+                      <p>No market makers for this venue</p>
+                      <p className="text-sm">Change the venue filter to view others</p>
+                    </>
+                  ) : (
+                    <>
+                      <p>No market makers configured</p>
+                      <p className="text-sm">Add a market to start making</p>
+                    </>
+                  )}
                 </TableCell>
               </TableRow>
             ) : (

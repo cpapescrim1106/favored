@@ -1,6 +1,15 @@
 import { prisma } from "@/lib/db";
 import { NextResponse } from "next/server";
-import { configureCLOB, fetchActiveOrders, getBalance, getPositions } from "@favored/shared";
+import {
+  configureCLOB,
+  fetchActiveOrders,
+  getBalance,
+  getPositions,
+  getKalshiBalance,
+  getVenueAdapter,
+  isKalshiConfigured,
+  registerDefaultVenues,
+} from "@favored/shared";
 
 const STATUS_STALE_MS = Number(process.env.MM_STATUS_STALE_MS ?? 120000);
 
@@ -38,6 +47,9 @@ async function timedCheck<T>(
 export async function GET() {
   try {
     configureCLOB({ dryRun: false });
+    registerDefaultVenues();
+    const kalshiConfigured = isKalshiConfigured();
+    const kalshiAdapter = kalshiConfigured ? getVenueAdapter("kalshi") : null;
 
     const [
       config,
@@ -48,6 +60,9 @@ export async function GET() {
       balanceCheck,
       openOrdersCheck,
       positionsCheck,
+      kalshiBalanceCheck,
+      kalshiOpenOrdersCheck,
+      kalshiPositionsCheck,
     ] = await Promise.all([
       prisma.config.findUnique({ where: { id: "singleton" } }),
       prisma.marketMaker.count({ where: { active: true } }),
@@ -60,6 +75,9 @@ export async function GET() {
       timedCheck(() => getBalance()),
       timedCheck(() => fetchActiveOrders()),
       timedCheck(() => getPositions(undefined, { sizeThreshold: 0, limit: 500 })),
+      kalshiConfigured ? timedCheck(() => getKalshiBalance()) : Promise.resolve({ ok: false, durationMs: 0, error: "not_configured" }),
+      kalshiAdapter ? timedCheck(() => kalshiAdapter.getOpenOrders()) : Promise.resolve({ ok: false, durationMs: 0, error: "not_configured" }),
+      kalshiAdapter ? timedCheck(() => kalshiAdapter.getPositions()) : Promise.resolve({ ok: false, durationMs: 0, error: "not_configured" }),
     ]);
 
     const now = Date.now();
@@ -85,6 +103,20 @@ export async function GET() {
       !positionsCheck.ok ||
       openOrdersEmptyWithTracked;
 
+    const kalshiOpenOrdersCount =
+      kalshiOpenOrdersCheck.ok && Array.isArray(kalshiOpenOrdersCheck.value)
+        ? kalshiOpenOrdersCheck.value.length
+        : null;
+    const kalshiPositionsCount =
+      kalshiPositionsCheck.ok && Array.isArray(kalshiPositionsCheck.value)
+        ? kalshiPositionsCheck.value.length
+        : null;
+    const kalshiDependencyDegraded =
+      !kalshiConfigured ||
+      !kalshiBalanceCheck.ok ||
+      !kalshiOpenOrdersCheck.ok ||
+      !kalshiPositionsCheck.ok;
+
     return NextResponse.json({
       now: new Date(now).toISOString(),
       dependencyHealth: {
@@ -108,6 +140,33 @@ export async function GET() {
           durationMs: positionsCheck.durationMs,
           count: positionsCount,
           error: positionsCheck.error,
+        },
+      },
+      kalshi: {
+        configured: kalshiConfigured,
+        dependencyHealth: {
+          degraded: kalshiDependencyDegraded,
+          balance: {
+            ok: kalshiBalanceCheck.ok,
+            durationMs: kalshiBalanceCheck.durationMs,
+            balance: kalshiBalanceCheck.ok ? kalshiBalanceCheck.value?.balance ?? null : null,
+            portfolioValue: kalshiBalanceCheck.ok
+              ? kalshiBalanceCheck.value?.portfolioValue ?? null
+              : null,
+            error: kalshiBalanceCheck.error,
+          },
+          openOrders: {
+            ok: kalshiOpenOrdersCheck.ok,
+            durationMs: kalshiOpenOrdersCheck.durationMs,
+            count: kalshiOpenOrdersCount,
+            error: kalshiOpenOrdersCheck.error,
+          },
+          positions: {
+            ok: kalshiPositionsCheck.ok,
+            durationMs: kalshiPositionsCheck.durationMs,
+            count: kalshiPositionsCount,
+            error: kalshiPositionsCheck.error,
+          },
         },
       },
       marketMaking: {
