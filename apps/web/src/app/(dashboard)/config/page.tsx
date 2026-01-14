@@ -106,12 +106,25 @@ export default function ConfigPage() {
 
   const handleSave = () => {
     if (!formData) return;
+    const excludedCategories = excludedCategoriesInput
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     saveMutation.mutate({
-      ...formData,
-      excludedCategories: excludedCategoriesInput
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
+      minProb: formData.minProb,
+      maxProb: formData.maxProb,
+      maxSpread: formData.maxSpread,
+      minLiquidity: formData.minLiquidity,
+      defaultStake: formData.defaultStake,
+      maxStakePerMarket: formData.maxStakePerMarket,
+      maxExposurePerMarket: formData.maxExposurePerMarket,
+      maxExposurePerCategory: formData.maxExposurePerCategory,
+      maxOpenPositions: formData.maxOpenPositions,
+      maxTotalExposure: formData.maxTotalExposure,
+      takeProfitThreshold: formData.takeProfitThreshold,
+      maxSlippage: formData.maxSlippage,
+      scanInterval: formData.scanInterval,
+      excludedCategories,
     });
   };
 

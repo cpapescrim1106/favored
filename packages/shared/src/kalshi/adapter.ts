@@ -154,15 +154,21 @@ export class KalshiAdapter implements VenueAdapter {
     const limit = Number(params?.limit ?? 1000);
     const maxPages = Number(params?.maxPages ?? 5);
     const status = params?.status ? String(params.status) : "open";
+    const mveFilter = params?.mveFilter ?? params?.mve_filter;
 
     const results: VenueMarket[] = [];
-    let cursor = "";
+    let cursor: string | undefined;
 
     for (let page = 0; page < maxPages; page++) {
       const response = await kalshiRequest<KalshiMarketsResponse>({
         method: "GET",
         path: "/markets",
-        query: { limit, cursor, status },
+        query: {
+          limit,
+          cursor,
+          status,
+          mve_filter: mveFilter ? String(mveFilter) : undefined,
+        },
       });
 
       for (const market of response.markets ?? []) {

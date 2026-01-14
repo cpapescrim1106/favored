@@ -48,9 +48,10 @@ export interface MMScreeningParams {
   // Liquidity filters
   maxSpreadTicks: number; // Max spread in ticks (default: 2 = $0.02)
   minTopDepthNotional: number; // Min $ at best bid + ask (default: 300)
-  minDepthWithin3cNotional: number; // Min $ within ±3¢ combined (default: 2000)
-  minDepthEachSideWithin3c: number; // Min $ each side within ±3¢ (default: 800)
+  minDepthWithin3cNotional: number; // Min $ within depthRangeCents combined (default: 2000)
+  minDepthEachSideWithin3c: number; // Min $ each side within depthRangeCents (default: 800)
   minBookSlope: number; // depth_1c / depth_5c ratio (default: 0.15)
+  depthRangeCents: number; // Depth window for liquidity/queue metrics (default: 3)
 
   // Volume filters
   minVolume24h: number; // Min 24h volume (default: 10000)
@@ -130,6 +131,7 @@ export const DEFAULT_MM_SCREENING_PARAMS: MMScreeningParams = {
   minDepthWithin3cNotional: 1500, // $1500 within ±3¢
   minDepthEachSideWithin3c: 500, // $500 each side within ±3¢
   minBookSlope: 0.1, // Require some concentration
+  depthRangeCents: 3,
   minVolume24h: 25000, // Focus on higher flow markets
   flowVolumeTarget: 250000, // Volume to reach max flow score
   assumedOrderSize: 100,
@@ -253,7 +255,8 @@ export interface BookMetrics {
 export function analyzeOrderBook(
   book: OrderBook,
   pricing?: CLOBPricing,
-  tickSize: number = MM_TICK_SIZE
+  tickSize: number = MM_TICK_SIZE,
+  depthRangeCents: number = 3
 ): BookMetrics {
   const midPrice =
     pricing?.midpoint !== null && pricing?.midpoint !== undefined
@@ -266,7 +269,9 @@ export function analyzeOrderBook(
       : calculateSpreadTicks(book, tickSize);
 
   const topDepthNotional = calculateTopDepth(book);
-  const depth3c = midPrice === null ? { bidDepth: 0, askDepth: 0, total: 0 } : calculateDepthWithinRange(book, midPrice, 3);
+  const depth3c = midPrice === null
+    ? { bidDepth: 0, askDepth: 0, total: 0 }
+    : calculateDepthWithinRange(book, midPrice, depthRangeCents);
   const bookSlope = midPrice === null ? 0 : calculateBookSlope(book, midPrice);
 
   return {
@@ -512,8 +517,9 @@ export function screenMarketForMM(
   const flags: string[] = [];
   const disqualifyReasons: string[] = [];
 
-  const yesMetrics = analyzeOrderBook(yesBook, clobPricing?.yes, tickSize);
-  const noMetrics = noBook ? analyzeOrderBook(noBook, clobPricing?.no, tickSize) : null;
+  const depthRangeCents = params.depthRangeCents ?? 3;
+  const yesMetrics = analyzeOrderBook(yesBook, clobPricing?.yes, tickSize, depthRangeCents);
+  const noMetrics = noBook ? analyzeOrderBook(noBook, clobPricing?.no, tickSize, depthRangeCents) : null;
   const hasNoBook = Boolean(noMetrics && noMetrics.midPrice !== null && noMetrics.spreadTicks !== null);
 
   // Handle missing data
@@ -618,7 +624,9 @@ export function screenMarketForMM(
 
   // Depth within 3c too thin
   if (depth3cTotal < params.minDepthWithin3cNotional) {
-    disqualifyReasons.push(`Depth within 3c too thin ($${depth3cTotal.toFixed(0)} < $${params.minDepthWithin3cNotional})`);
+    disqualifyReasons.push(
+      `Depth within ${depthRangeCents}c too thin ($${depth3cTotal.toFixed(0)} < $${params.minDepthWithin3cNotional})`
+    );
     flags.push("Shallow book");
   }
 
@@ -642,11 +650,8 @@ export function screenMarketForMM(
     }
   }
 
-  // Queue depth too large
+  // Queue depth too large (warning only; flow is a stronger signal)
   if (queueDepthRatio > params.maxQueueDepthRatio) {
-    disqualifyReasons.push(
-      `Queue too deep (${queueDepthRatio.toFixed(0)}x > ${params.maxQueueDepthRatio}x order size)`
-    );
     flags.push("Deep queue");
   }
 

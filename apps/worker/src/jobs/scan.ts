@@ -233,16 +233,25 @@ export async function runScanJob(): Promise<void> {
       const kalshiMarkets = await kalshi.listMarkets({
         status: "open",
         limit: Number(process.env.KALSHI_SCAN_LIMIT ?? 1000),
-        maxPages: Number(process.env.KALSHI_SCAN_PAGES ?? 3),
+        maxPages: Number(process.env.KALSHI_SCAN_PAGES ?? 10),
+        mveFilter: "exclude",
       });
 
       console.log(`[Scan] Fetched ${kalshiMarkets.length} Kalshi markets`);
 
-      const kalshiMinLiquidity = Number(
-        process.env.KALSHI_SCAN_MIN_LIQUIDITY ?? minLiquidity
-      );
+      const kalshiMinLiquidity = Number(process.env.KALSHI_SCAN_MIN_LIQUIDITY ?? 0);
+      const kalshiMinVolume24h = Number(process.env.KALSHI_SCAN_MIN_VOLUME_24H ?? 100);
+      const kalshiExcludeCombos = process.env.KALSHI_SCAN_EXCLUDE_COMBOS !== "false";
+      const isKalshiCombo = (ticker: string, eventTicker?: string | null) => {
+        const normalizedTicker = ticker.toUpperCase();
+        const normalizedEvent = eventTicker ? eventTicker.toUpperCase() : "";
+        return normalizedTicker.startsWith("KXMVE") || normalizedEvent.startsWith("KXMVE");
+      };
 
       for (const market of kalshiMarkets) {
+        if (kalshiExcludeCombos && isKalshiCombo(market.venueMarketId, market.eventId)) {
+          continue;
+        }
         const yesPrice = market.yesPrice ?? null;
         const noPrice = market.noPrice ?? (yesPrice !== null ? 1 - yesPrice : null);
         if (yesPrice === null || noPrice === null) continue;
@@ -251,6 +260,7 @@ export async function runScanJob(): Promise<void> {
         if (kalshiMinLiquidity && liquidityValue < kalshiMinLiquidity) continue;
 
         const volume24h = market.volume24h ?? 0;
+        if (kalshiMinVolume24h && volume24h < kalshiMinVolume24h) continue;
         const endDate = market.closeTime ? new Date(market.closeTime) : null;
         const daysToClose = endDate
           ? Math.max(0, (endDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24))

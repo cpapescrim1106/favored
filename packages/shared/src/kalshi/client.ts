@@ -137,12 +137,13 @@ export async function kalshiRequest<T>(params: {
   const { method, path: requestPath, query, data, auth } = params;
   const client = getHttpClient();
 
-  const queryString = query
-    ? `?${new URLSearchParams(
-        Object.entries(query)
-          .filter(([, value]) => value !== undefined)
-          .map(([key, value]) => [key, String(value)])
-      ).toString()}`
+  const queryEntries: Array<[string, string]> = query
+    ? Object.entries(query)
+        .filter(([, value]) => value !== undefined)
+        .map(([key, value]) => [key, String(value)])
+    : [];
+  const queryString = queryEntries.length
+    ? `?${new URLSearchParams(queryEntries).toString()}`
     : "";
 
   const fullPath = `${requestPath}${queryString}`;

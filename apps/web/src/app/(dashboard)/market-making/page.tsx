@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Table,
@@ -143,6 +143,7 @@ interface MMCandidate {
   question: string;
   category: string | null;
   endDate: string | null;
+  venue: "POLYMARKET" | "KALSHI";
   midPrice: number;
   spreadTicks: number;
   spreadPercent: number;
@@ -191,6 +192,18 @@ export default function MarketMakingPage() {
   const [dialogStep, setDialogStep] = useState<"select" | "configure">("select");
   const [pnlWindow, setPnlWindow] = useState<"24h" | "1w" | "all">("24h");
   const [venueFilter, setVenueFilter] = useState<"all" | "POLYMARKET" | "KALSHI">("all");
+  const [candidateVenueFilter, setCandidateVenueFilter] = useState<
+    "all" | "POLYMARKET" | "KALSHI"
+  >("all");
+  const [candidateScreenVenue, setCandidateScreenVenue] = useState<
+    "all" | "POLYMARKET" | "KALSHI"
+  >("all");
+  const [candidateEligibleOnly, setCandidateEligibleOnly] = useState(true);
+  const [candidateResults, setCandidateResults] = useState<MMCandidate[]>([]);
+  const [candidateTotal, setCandidateTotal] = useState<number | null>(null);
+  const [candidateScreening, setCandidateScreening] = useState(false);
+  const [candidateLastRunAt, setCandidateLastRunAt] = useState<Date | null>(null);
+  const [candidateError, setCandidateError] = useState<string | null>(null);
   const [bulkDialogOpen, setBulkDialogOpen] = useState(false);
   const [bulkApplyToAll, setBulkApplyToAll] = useState(false);
   const [fillsOpen, setFillsOpen] = useState(false);
@@ -242,20 +255,26 @@ export default function MarketMakingPage() {
     refetchOnWindowFocus: false,
   });
 
-  // Fetch MM candidates when dialog opens
-  const {
-    data: candidatesData,
-    isLoading: candidatesLoading,
-    refetch: refetchCandidates,
-  } = useQuery<MMCandidatesData>({
-    queryKey: ["mm-candidates"],
-    queryFn: async () => {
-      const res = await fetch("/api/mm-candidates?limit=30&eligibleOnly=true");
+  const runCandidateScreen = async () => {
+    setCandidateScreening(true);
+    setCandidateError(null);
+    try {
+      const res = await fetch(
+        `/api/mm-candidates?limit=30&eligibleOnly=${candidateEligibleOnly}&venue=${candidateScreenVenue}`
+      );
       if (!res.ok) throw new Error("Failed to fetch candidates");
-      return res.json();
-    },
-    enabled: addDialogOpen && dialogStep === "select",
-  });
+      const data: MMCandidatesData = await res.json();
+      setCandidateResults(data.candidates ?? []);
+      setCandidateTotal(data.total ?? data.candidates?.length ?? 0);
+      setCandidateLastRunAt(new Date());
+    } catch (error) {
+      setCandidateError(error instanceof Error ? error.message : "Failed to fetch candidates");
+      setCandidateResults([]);
+      setCandidateTotal(0);
+    } finally {
+      setCandidateScreening(false);
+    }
+  };
 
   // Toggle MM enabled
   const toggleMM = useMutation({
@@ -299,7 +318,6 @@ export default function MarketMakingPage() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["market-making"] });
-      queryClient.invalidateQueries({ queryKey: ["mm-candidates"] });
       handleCloseDialog();
     },
   });
@@ -380,7 +398,6 @@ export default function MarketMakingPage() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["market-making"] });
-      queryClient.invalidateQueries({ queryKey: ["mm-candidates"] });
     },
   });
 
@@ -388,6 +405,7 @@ export default function MarketMakingPage() {
     setAddDialogOpen(false);
     setSelectedCandidate(null);
     setDialogStep("select");
+    setCandidateError(null);
   };
 
   const handleSelectCandidate = (candidate: MMCandidate) => {
@@ -436,7 +454,14 @@ export default function MarketMakingPage() {
   const fillsCountLabel = fillsTotalCount === null ? "—" : fillsTotalCount;
   const marketMakers = data?.marketMakers || [];
   const mmEnabled = data?.mmEnabled || false;
-  const candidates = candidatesData?.candidates || [];
+  const candidates = candidateResults;
+  const filteredCandidates = useMemo(() => {
+    if (candidateVenueFilter === "all") return candidates;
+    return candidates.filter((candidate) => candidate.venue === candidateVenueFilter);
+  }, [candidateVenueFilter, candidates]);
+  const filteredCandidateCount = filteredCandidates.length;
+  const candidateCountLabel =
+    candidateTotal === null ? "—" : `${filteredCandidateCount}/${candidateTotal}`;
   const marketMakerOrder = new Map(
     marketMakers.map((mm, index) => [mm.id, index])
   );
@@ -897,21 +922,116 @@ export default function MarketMakingPage() {
                     </DialogDescription>
                   </DialogHeader>
                   <div className="py-4">
-                    {candidatesLoading ? (
+                    <div className="flex flex-col gap-3 pb-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <span className="text-xs text-zinc-500 uppercase">Screen Venue</span>
+                        <div className="flex items-center gap-2">
+                          <div className="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1">
+                            {[
+                              { value: "all", label: "All" },
+                              { value: "POLYMARKET", label: "Poly" },
+                              { value: "KALSHI", label: "Kalshi" },
+                            ].map((option) => (
+                              <Button
+                                key={option.value}
+                                type="button"
+                                variant={
+                                  candidateScreenVenue === option.value ? "secondary" : "ghost"
+                                }
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                onClick={() =>
+                                  setCandidateScreenVenue(
+                                    option.value as "all" | "POLYMARKET" | "KALSHI"
+                                  )
+                                }
+                              >
+                                {option.label}
+                              </Button>
+                            ))}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-zinc-500">Eligible only</span>
+                            <Switch
+                              checked={candidateEligibleOnly}
+                              onCheckedChange={(checked) => setCandidateEligibleOnly(checked)}
+                            />
+                          </div>
+                          <Button
+                            type="button"
+                            size="sm"
+                            onClick={runCandidateScreen}
+                            disabled={candidateScreening}
+                          >
+                            {candidateScreening ? "Screening..." : "Run Screen"}
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <span className="text-xs text-zinc-500 uppercase">Filter Results</span>
+                        <div className="flex items-center gap-3">
+                          <div className="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1">
+                            {[
+                              { value: "all", label: "All" },
+                              { value: "POLYMARKET", label: "Poly" },
+                              { value: "KALSHI", label: "Kalshi" },
+                            ].map((option) => (
+                              <Button
+                                key={option.value}
+                                type="button"
+                                variant={
+                                  candidateVenueFilter === option.value ? "secondary" : "ghost"
+                                }
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                onClick={() =>
+                                  setCandidateVenueFilter(
+                                    option.value as "all" | "POLYMARKET" | "KALSHI"
+                                  )
+                                }
+                              >
+                                {option.label}
+                              </Button>
+                            ))}
+                          </div>
+                          <span className="text-xs text-zinc-500">{candidateCountLabel}</span>
+                        </div>
+                      </div>
+                      {candidateLastRunAt && (
+                        <div className="text-xs text-zinc-500">
+                          Last screened {formatDistanceToNow(candidateLastRunAt, { addSuffix: true })}
+                        </div>
+                      )}
+                    </div>
+                    {candidateScreening ? (
                       <div className="flex items-center justify-center py-12">
                         <Loader2 className="h-8 w-8 animate-spin text-zinc-400" />
                         <span className="ml-2 text-zinc-500">Screening markets...</span>
                       </div>
-                    ) : candidates.length === 0 ? (
+                    ) : candidateError ? (
                       <div className="text-center py-12 text-zinc-500">
-                        <Search className="h-12 w-12 mx-auto mb-2 opacity-20" />
-                        <p>No eligible markets found</p>
-                        <p className="text-sm">Try adjusting screening parameters</p>
+                        <AlertTriangle className="h-12 w-12 mx-auto mb-2 opacity-20" />
+                        <p>{candidateError}</p>
                         <Button
                           variant="outline"
                           size="sm"
                           className="mt-4"
-                          onClick={() => refetchCandidates()}
+                          onClick={runCandidateScreen}
+                        >
+                          <RefreshCw className="h-4 w-4 mr-1" />
+                          Retry
+                        </Button>
+                      </div>
+                    ) : filteredCandidates.length === 0 ? (
+                      <div className="text-center py-12 text-zinc-500">
+                        <Search className="h-12 w-12 mx-auto mb-2 opacity-20" />
+                        <p>No markets found</p>
+                        <p className="text-sm">Run a screen or adjust filters</p>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="mt-4"
+                          onClick={runCandidateScreen}
                         >
                           <RefreshCw className="h-4 w-4 mr-1" />
                           Refresh
@@ -920,7 +1040,7 @@ export default function MarketMakingPage() {
                     ) : (
                       <ScrollArea className="h-[400px] pr-4">
                         <div className="space-y-2">
-                          {candidates.map((candidate) => (
+                          {filteredCandidates.map((candidate) => (
                             <button
                               key={candidate.marketId}
                               onClick={() => handleSelectCandidate(candidate)}
@@ -932,6 +1052,9 @@ export default function MarketMakingPage() {
                                     {candidate.question}
                                   </p>
                                   <div className="flex items-center gap-2 mt-1 text-xs text-zinc-500">
+                                    <Badge variant="outline" className="text-[10px] px-1.5 py-0">
+                                      {candidate.venue === "KALSHI" ? "Kalshi" : "Poly"}
+                                    </Badge>
                                     <span>{candidate.category || "—"}</span>
                                     <span>·</span>
                                     <span>${candidate.volume24h >= 1000000 ? `${(candidate.volume24h / 1000000).toFixed(1)}M` : `${(candidate.volume24h / 1000).toFixed(0)}k`} vol</span>
@@ -951,6 +1074,11 @@ export default function MarketMakingPage() {
                                           {flag}
                                         </Badge>
                                       ))}
+                                      {!candidate.eligible && (
+                                        <Badge variant="outline" className="text-xs text-zinc-500">
+                                          Ineligible
+                                        </Badge>
+                                      )}
                                     </div>
                                   )}
                                 </div>
