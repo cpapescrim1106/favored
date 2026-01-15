@@ -1,6 +1,90 @@
 import { prisma } from "@/lib/db";
+import { slugify } from "@/utils/slug";
 import { NextRequest, NextResponse } from "next/server";
-import { getBalance, getBestPrices, getKalshiBalance } from "@favored/shared";
+import {
+  getBalance,
+  getBestPrices,
+  getKalshiBalance,
+  kalshiRequest,
+} from "@favored/shared";
+
+type KalshiEventResponse = {
+  event?: {
+    series_ticker?: string | null;
+  };
+};
+
+type KalshiSeriesResponse = {
+  series?: {
+    ticker?: string | null;
+    title?: string | null;
+  };
+};
+
+const kalshiEventSeriesCache = new Map<string, string>();
+const kalshiSeriesSlugCache = new Map<string, { ticker: string; slug: string }>();
+
+async function getKalshiSeriesInfo(eventTicker: string) {
+  const cachedSeriesTicker = kalshiEventSeriesCache.get(eventTicker);
+  let seriesTicker = cachedSeriesTicker;
+
+  if (!seriesTicker) {
+    try {
+      const eventResponse = await kalshiRequest<KalshiEventResponse>({
+        method: "GET",
+        path: `/events/${eventTicker}`,
+      });
+      if (eventResponse.event?.series_ticker) {
+        seriesTicker = eventResponse.event.series_ticker;
+        kalshiEventSeriesCache.set(eventTicker, seriesTicker);
+      }
+    } catch (error) {
+      return null;
+    }
+  }
+
+  if (!seriesTicker) return null;
+
+  const cachedSeries = kalshiSeriesSlugCache.get(seriesTicker);
+  if (cachedSeries) return cachedSeries;
+
+  try {
+    const seriesResponse = await kalshiRequest<KalshiSeriesResponse>({
+      method: "GET",
+      path: `/series/${seriesTicker}`,
+    });
+    if (!seriesResponse.series?.title) return null;
+    const seriesSlug = slugify(seriesResponse.series.title);
+    const resolvedTicker = seriesResponse.series.ticker ?? seriesTicker;
+    const resolved = { ticker: resolvedTicker, slug: seriesSlug };
+    kalshiSeriesSlugCache.set(seriesTicker, resolved);
+    return resolved;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function buildMarketUrl(market: {
+  venue: "POLYMARKET" | "KALSHI";
+  slug: string;
+  eventSlug: string | null;
+  eventTicker: string | null;
+}): Promise<string | null> {
+  if (market.venue === "POLYMARKET") {
+    return `https://polymarket.com/event/${market.eventSlug || market.slug}`;
+  }
+
+  if (!market.eventTicker) {
+    return `https://kalshi.com/markets/${market.slug.toLowerCase()}`;
+  }
+
+  const seriesInfo = await getKalshiSeriesInfo(market.eventTicker);
+  if (!seriesInfo?.slug) {
+    return `https://kalshi.com/markets/${market.slug.toLowerCase()}`;
+  }
+
+  return `https://kalshi.com/markets/${seriesInfo.ticker.toLowerCase()}/${seriesInfo.slug}/${market.slug.toLowerCase()}`;
+}
 
 /**
  * GET /api/market-making
@@ -20,6 +104,8 @@ export async function GET() {
             slug: true,
             question: true,
             category: true,
+            eventSlug: true,
+            eventTicker: true,
             yesPrice: true,
             noPrice: true,
             endDate: true,
@@ -178,6 +264,19 @@ export async function GET() {
       })
     );
 
+    const marketUrls = await Promise.all(
+      marketMakers.map((mm) =>
+        mm.market
+          ? buildMarketUrl({
+              venue: mm.market.venue,
+              slug: mm.market.slug,
+              eventSlug: mm.market.eventSlug ?? null,
+              eventTicker: mm.market.eventTicker ?? null,
+            })
+          : Promise.resolve(null)
+      )
+    );
+
     return NextResponse.json({
       mmEnabled: config?.mmEnabled ?? false,
       summary: {
@@ -200,12 +299,15 @@ export async function GET() {
               slug: mm.market.slug,
               question: mm.market.question,
               category: mm.market.category,
+              eventSlug: mm.market.eventSlug ?? null,
+              eventTicker: mm.market.eventTicker ?? null,
               yesPrice: mm.market.yesPrice ? Number(mm.market.yesPrice) : null,
               noPrice: mm.market.noPrice ? Number(mm.market.noPrice) : null,
               yesBestBid: bestBidResults[index]?.yesBestBid ?? null,
               noBestBid: bestBidResults[index]?.noBestBid ?? null,
               endDate: mm.market.endDate?.toISOString() || null,
               venue: mm.market.venue,
+              url: marketUrls[index] ?? null,
             }
           : null,
         active: mm.active,

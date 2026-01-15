@@ -20,10 +20,16 @@ import {
 const ORDERBOOK_DELAY_MS = 50;
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const POLY_STRATIFY_POOL_MULTIPLIER = 6;
+const POLY_STRATIFY_MAX_CATEGORIES = 8;
+const POLY_STRATIFY_MIN_PER_CATEGORY = 5;
 const KALSHI_TRADE_LOOKBACK_SECONDS = 60 * 60;
 const KALSHI_MIN_RECENT_TRADES = 1;
 const KALSHI_MIN_VOLUME_24H = 100;
 const KALSHI_TRADE_LIMIT = 25;
+const KALSHI_STRATIFY_POOL_MULTIPLIER = 10;
+const KALSHI_STRATIFY_MAX_CATEGORIES = 8;
+const KALSHI_STRATIFY_MIN_PER_CATEGORY = 5;
 const KALSHI_SOFT_DISQUALIFY_PREFIXES = [
   "Top depth too thin",
   "Depth within 3c too thin",
@@ -41,6 +47,72 @@ const isKalshiComboMarket = (marketId: string, eventTicker?: string | null) => {
   const normalizedId = marketId.toUpperCase();
   const normalizedEvent = eventTicker ? eventTicker.toUpperCase() : "";
   return normalizedId.startsWith("KXMVE") || normalizedEvent.startsWith("KXMVE");
+};
+
+const getCategoryKey = (category: string | null) =>
+  (category ?? "Uncategorized").trim() || "Uncategorized";
+
+const stratifyMarkets = (
+  markets: Array<{
+    id: string;
+    category: string | null;
+    volume24h: number | null;
+  }>,
+  targetCount: number,
+  options: {
+    maxCategories: number;
+    minPerCategory: number;
+  }
+) => {
+  if (markets.length <= targetCount) return markets;
+
+  const byCategory = new Map<string, typeof markets>();
+  for (const market of markets) {
+    const key = getCategoryKey(market.category).toLowerCase();
+    const list = byCategory.get(key) ?? [];
+    list.push(market);
+    byCategory.set(key, list);
+  }
+
+  const categories = Array.from(byCategory.entries()).map(([key, list]) => ({
+    key,
+    totalVolume: list.reduce((sum, item) => sum + (item.volume24h ?? 0), 0),
+    items: list,
+  }));
+
+  categories.sort((a, b) => b.totalVolume - a.totalVolume);
+  const selectedCategories = categories.slice(0, options.maxCategories);
+  if (selectedCategories.length === 0) return markets.slice(0, targetCount);
+
+  const perCategoryQuota = Math.max(
+    options.minPerCategory,
+    Math.ceil(targetCount / selectedCategories.length)
+  );
+
+  const selected: typeof markets = [];
+  const selectedIds = new Set<string>();
+
+  for (const category of selectedCategories) {
+    category.items.sort((a, b) => (b.volume24h ?? 0) - (a.volume24h ?? 0));
+    for (const market of category.items.slice(0, perCategoryQuota)) {
+      if (selectedIds.has(market.id)) continue;
+      selected.push(market);
+      selectedIds.add(market.id);
+    }
+  }
+
+  if (selected.length >= targetCount) {
+    return selected.slice(0, targetCount);
+  }
+
+  for (const market of markets) {
+    if (selectedIds.has(market.id)) continue;
+    selected.push(market);
+    selectedIds.add(market.id);
+    if (selected.length >= targetCount) break;
+  }
+
+  return selected;
 };
 
 async function fetchKalshiRecentTrades(ticker: string) {
@@ -112,7 +184,8 @@ export async function GET(request: NextRequest) {
     if (wantsPolymarket) {
       // Fetch active Polymarket markets from DB
       // Pre-filter: must have decent volume, valid price range, clobTokenIds, and no market maker
-      const markets = await prisma.market.findMany({
+      const poolCount = takeCount * POLY_STRATIFY_POOL_MULTIPLIER;
+      const marketPool = await prisma.market.findMany({
         where: {
           active: true,
           venue: "POLYMARKET",
@@ -136,10 +209,28 @@ export async function GET(request: NextRequest) {
           ],
         },
         orderBy: { volume24h: "desc" },
-        take: takeCount, // Fetch extra since some will be filtered
+        take: poolCount,
       });
 
-      console.log(`[MM Candidates] Screening ${markets.length} Polymarket markets...`);
+      const poolById = new Map(marketPool.map((market) => [market.id, market]));
+      const markets = stratifyMarkets(
+        marketPool.map((market) => ({
+          id: market.id,
+          category: market.category,
+          volume24h: market.volume24h ? Number(market.volume24h) : 0,
+        })),
+        takeCount,
+        {
+          maxCategories: POLY_STRATIFY_MAX_CATEGORIES,
+          minPerCategory: POLY_STRATIFY_MIN_PER_CATEGORY,
+        }
+      )
+        .map(({ id }) => poolById.get(id))
+        .filter(Boolean);
+
+      console.log(
+        `[MM Candidates] Screening ${markets.length} Polymarket markets (stratified)...`
+      );
 
       // Screen each market
       for (const market of markets) {
@@ -222,7 +313,8 @@ export async function GET(request: NextRequest) {
         depthRangeCents: 2,
       };
 
-      const markets = await prisma.market.findMany({
+      const poolCount = takeCount * KALSHI_STRATIFY_POOL_MULTIPLIER;
+      const marketPool = await prisma.market.findMany({
         where: {
           active: true,
           venue: "KALSHI",
@@ -233,10 +325,28 @@ export async function GET(request: NextRequest) {
           ],
         },
         orderBy: { volume24h: "desc" },
-        take: takeCount,
+        take: poolCount,
       });
 
-      console.log(`[MM Candidates] Screening ${markets.length} Kalshi markets...`);
+      const poolById = new Map(marketPool.map((market) => [market.id, market]));
+      const markets = stratifyMarkets(
+        marketPool.map((market) => ({
+          id: market.id,
+          category: market.category,
+          volume24h: market.volume24h ? Number(market.volume24h) : 0,
+        })),
+        takeCount,
+        {
+          maxCategories: KALSHI_STRATIFY_MAX_CATEGORIES,
+          minPerCategory: KALSHI_STRATIFY_MIN_PER_CATEGORY,
+        }
+      )
+        .map(({ id }) => poolById.get(id))
+        .filter(Boolean);
+
+      console.log(
+        `[MM Candidates] Screening ${markets.length} Kalshi markets (stratified)...`
+      );
 
       for (const market of markets) {
         if (isKalshiComboMarket(market.id, market.eventTicker)) {

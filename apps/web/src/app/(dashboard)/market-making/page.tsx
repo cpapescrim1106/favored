@@ -65,6 +65,8 @@ interface MarketMaker {
   marketId: string;
   market: {
     slug: string;
+    eventSlug: string | null;
+    eventTicker: string | null;
     question: string;
     category: string | null;
     yesPrice: number | null;
@@ -73,6 +75,7 @@ interface MarketMaker {
     noBestBid: number | null;
     endDate: string | null;
     venue: "POLYMARKET" | "KALSHI";
+    url: string | null;
   } | null;
   active: boolean;
   paused: boolean;
@@ -1527,6 +1530,7 @@ export default function MarketMakingPage() {
                     : "text-zinc-500";
 
                 const staleClass = getStaleRowClass(mm);
+                const marketUrl = mm.market?.url ?? null;
 
                 return (
                   <TableRow
@@ -1544,9 +1548,9 @@ export default function MarketMakingPage() {
                     </TableCell>
                     <TableCell className="font-medium">
                       <div>
-                        {mm.market?.venue === "POLYMARKET" ? (
+                        {marketUrl ? (
                           <a
-                            href={`https://polymarket.com/market/${mm.market?.slug}`}
+                            href={marketUrl}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="hover:underline line-clamp-1"

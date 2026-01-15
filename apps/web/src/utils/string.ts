@@ -1,5 +1,6 @@
 import { remark } from "remark";
 import strip from "strip-markdown";
+import { slugify } from "@/utils/slug";
 
 export async function stripMarkdown(content: string) {
   const file = await remark().use(strip).process(content);
@@ -93,13 +94,4 @@ export async function excerptFromMarkdown(content: string, length = 100) {
   return sliceWithoutBreakWord(stripped, 0, length, { maxTrimmedLength: 10 });
 }
 
-export function slugify(text: string): string {
-  return text
-    .normalize("NFD") // Normalize accents
-    .replace(/[\u0300-\u036f]/g, "") // Remove diacritics
-    .toLowerCase() // Convert to lowercase
-    .trim() // Remove leading/trailing spaces
-    .replace(/[^a-z0-9\s-]/g, "") // Remove special chars except spaces and hyphens
-    .replace(/[\s_]+/g, "-") // Replace spaces and underscores with hyphens
-    .replace(/-+/g, "-"); // Remove consecutive hyphens
-}
+export { slugify };
