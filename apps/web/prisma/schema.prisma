@@ -14,6 +14,48 @@ datasource db {
 // MARKET DATA
 // ============================================================================
 
+enum MarketOutcome {
+  YES
+  NO
+}
+
+enum OrderSide {
+  BID
+  ASK
+}
+
+enum FillSide {
+  BUY
+  SELL
+}
+
+enum FillEventStatus {
+  PENDING
+  CONFIRMED
+  REJECTED
+}
+
+enum BasketItemStatus {
+  pending
+  submitted
+  filled
+  partial
+  failed
+  cancelled
+}
+
+enum TradeType {
+  ENTRY
+  EXIT
+}
+
+enum QuoteSide {
+  BID
+  ASK
+  BUY
+  SELL
+}
+
 enum Venue {
   POLYMARKET
   KALSHI
@@ -48,6 +90,7 @@ model Market {
 
   // Relations
   candidates  Candidate[]
+  mmCandidate MmCandidate?
   basketItems BasketItem[]
   positions   Position[]
   marketMaker MarketMaker?
@@ -72,7 +115,7 @@ model Candidate {
   marketId String
   market   Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
 
-  side        String  // "YES" or "NO"
+  side        MarketOutcome  // "YES" or "NO"
   outcomeName String? // Display name: "Rams", "Yes", "Trump", etc.
   impliedProb Decimal @db.Decimal(10, 6)
   score       Decimal @db.Decimal(10, 4)
@@ -86,6 +129,50 @@ model Candidate {
   @@index([scannedAt])
   @@index([score])
   @@map("candidates")
+}
+
+/// Market making candidate scores (latest per market)
+model MmCandidate {
+  marketId String @id
+  market   Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  venue Venue
+
+  // Snapshot metrics
+  midPrice        Decimal? @db.Decimal(10, 6)
+  spreadTicks     Int?
+  spreadPercent   Decimal? @db.Decimal(10, 6)
+  topDepthNotional Decimal? @db.Decimal(18, 6)
+  depth3cBid      Decimal? @db.Decimal(18, 6)
+  depth3cAsk      Decimal? @db.Decimal(18, 6)
+  depth3cTotal    Decimal? @db.Decimal(18, 6)
+  bookSlope       Decimal? @db.Decimal(10, 6)
+  volume24h       Decimal? @db.Decimal(18, 2)
+  queueSpeed      Decimal? @db.Decimal(10, 6)
+  queueDepthRatio Decimal? @db.Decimal(10, 6)
+  hoursToEnd      Decimal? @db.Decimal(10, 3)
+
+  // Scores (0-100)
+  liquidityScore  Int
+  flowScore       Int
+  timeScore       Int
+  priceZoneScore  Int
+  queueSpeedScore Int
+  queueDepthScore Int
+  totalScore      Int
+
+  // Status
+  eligible          Boolean
+  flags             String[] @default([])
+  disqualifyReasons String[] @default([])
+
+  scoredAt  DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([venue])
+  @@index([totalScore])
+  @@index([scoredAt])
+  @@map("mm_candidates")
 }
 
 // ============================================================================
@@ -127,7 +214,7 @@ model BasketItem {
   marketId String
   market   Market @relation(fields: [marketId], references: [id], onDelete: Restrict)
 
-  side          String // "YES" or "NO"
+  side          MarketOutcome // "YES" or "NO"
   stake         Decimal @db.Decimal(18, 2)
   limitPrice    Decimal @db.Decimal(10, 6)
   snapshotPrice Decimal @db.Decimal(10, 6) // Price at basket build
@@ -136,7 +223,7 @@ model BasketItem {
   orderId    String?
   fillPrice  Decimal? @db.Decimal(10, 6)
   fillAmount Decimal? @db.Decimal(18, 2)
-  status     String   @default("pending") // pending, submitted, filled, partial, failed, cancelled
+  status     BasketItemStatus   @default(pending) // pending, submitted, filled, partial, failed, cancelled
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -163,7 +250,7 @@ model Position {
   marketId String
   market   Market @relation(fields: [marketId], references: [id], onDelete: Restrict)
 
-  side      String  @db.VarChar(3) // "YES" or "NO"
+  side      MarketOutcome // "YES" or "NO"
   size      Decimal @db.Decimal(18, 6) // Token amount
   avgEntry  Decimal @db.Decimal(10, 6)
   totalCost Decimal @db.Decimal(18, 2)
@@ -193,8 +280,8 @@ model Trade {
   positionId String
   position   Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
 
-  type    String // "ENTRY" or "EXIT"
-  side    String // "BUY" or "SELL"
+  type    TradeType // "ENTRY" or "EXIT"
+  side    FillSide // "BUY" or "SELL"
   price   Decimal @db.Decimal(10, 6)
   size    Decimal @db.Decimal(18, 6)
   value   Decimal @db.Decimal(18, 2)
@@ -265,8 +352,8 @@ model MarketMakerOrder {
   marketMakerId String
   marketMaker   MarketMaker @relation(fields: [marketMakerId], references: [id], onDelete: Cascade)
 
-  outcome String // "YES" or "NO"
-  side    String // "BID" or "ASK"
+  outcome MarketOutcome // "YES" or "NO"
+  side    OrderSide // "BID" or "ASK"
   tier    Int    @default(0) // Tier level: 0 = closest to mid, 1 = next level, etc.
   orderId String // CLOB order ID
   clientOrderId String?
@@ -281,7 +368,7 @@ model MarketMakerOrder {
   updatedAt DateTime @updatedAt
 
   @@unique([marketMakerId, outcome, side, tier])
-  @@index([orderId])
+  @@unique([orderId]) // CRITICAL FIX: Prevent duplicate order tracking
   @@index([marketMakerId, outcome, side])
   @@map("market_maker_orders")
 }
@@ -292,8 +379,8 @@ model MarketMakerFill {
   marketMakerId String
   marketMaker   MarketMaker @relation(fields: [marketMakerId], references: [id], onDelete: Cascade)
 
-  outcome    String // "YES" or "NO"
-  side       String // "BUY" or "SELL"
+  outcome    MarketOutcome // "YES" or "NO"
+  side       FillSide // "BUY" or "SELL"
   orderId    String // CLOB order ID that was filled
   clientOrderId String?
   price      Decimal @db.Decimal(10, 6)
@@ -315,15 +402,15 @@ model MarketMakerFillEvent {
   marketMakerId String
   marketMaker   MarketMaker @relation(fields: [marketMakerId], references: [id], onDelete: Cascade)
 
-  outcome     String // "YES" or "NO"
-  side        String // "BUY" or "SELL"
+  outcome     MarketOutcome // "YES" or "NO"
+  side        FillSide // "BUY" or "SELL"
   orderId     String // CLOB order ID
   price       Decimal @db.Decimal(10, 6)
   size        Decimal @db.Decimal(18, 6) // Remaining size to confirm
   value       Decimal @db.Decimal(18, 6) // price * size
   matchedTotal Decimal @db.Decimal(18, 6) // CLOB cumulative matched size when observed
   source      String? // "poller", "ws", "sync"
-  status      String  @default("PENDING") // "PENDING", "CONFIRMED", "REJECTED"
+  status      FillEventStatus  @default(PENDING) // "PENDING", "CONFIRMED", "REJECTED"
   metadata    Json?
 
   observedAt  DateTime @default(now())
@@ -342,8 +429,8 @@ model QuoteHistory {
   marketMaker   MarketMaker @relation(fields: [marketMakerId], references: [id], onDelete: Cascade)
 
   action   String // "QUOTE_PLACED", "QUOTE_UPDATED", "QUOTE_CANCELLED", "FILL", "PAUSE", "RESUME", "ERROR"
-  outcome  String? // "YES" or "NO"
-  side     String? // "BID" or "ASK"
+  outcome  MarketOutcome? // "YES" or "NO"
+  side     QuoteSide? // "BID", "ASK", "BUY", or "SELL"
   price    Decimal? @db.Decimal(10, 6)
   size     Decimal? @db.Decimal(18, 6)
   orderId  String?

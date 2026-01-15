@@ -60,6 +60,17 @@ const MIN_ORDER_SIZE = (() => {
 const clampPrice = (price: number) => Math.min(MAX_PRICE, Math.max(MIN_PRICE, price));
 const roundToTick = (price: number) => Math.round(price / TICK_SIZE) * TICK_SIZE;
 
+type MarketOutcome = "YES" | "NO";
+type OrderSide = "BID" | "ASK";
+type FillSide = "BUY" | "SELL";
+type QuoteSide = OrderSide | FillSide;
+
+const toMarketOutcome = (value: string): MarketOutcome | null =>
+  value === "YES" || value === "NO" ? value : null;
+
+const toOrderSide = (value: string): OrderSide | null =>
+  value === "BID" || value === "ASK" ? value : null;
+
 // Helper function for delays
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -196,8 +207,8 @@ type MarketMakerWithOrders = Awaited<ReturnType<typeof prisma.marketMaker.findMa
   orders?: Array<{
     id: string;
     orderId: string;
-    outcome: string;
-    side: string;
+    outcome: MarketOutcome;
+    side: OrderSide;
     price: unknown;
     size: unknown;
     lastMatchedSize: unknown;
@@ -532,6 +543,7 @@ async function syncInventoryFromChain(
     noInventory: unknown;
     avgYesCost: unknown;
     avgNoCost: unknown;
+    realizedPnl: unknown;
     market?: { slug?: string; clobTokenIds?: string[] | null };
   }>,
   chainPositions: DataAPIPosition[]
@@ -556,8 +568,6 @@ async function syncInventoryFromChain(
 
     const nextYes = yesPos?.size ?? 0;
     const nextNo = noPos?.size ?? 0;
-    const nextAvgYes = yesPos?.avgPrice ?? 0;
-    const nextAvgNo = noPos?.avgPrice ?? 0;
 
     const driftYes = nextYes - Number(mm.yesInventory);
     const driftNo = nextNo - Number(mm.noInventory);
@@ -566,11 +576,11 @@ async function syncInventoryFromChain(
       driftByOutcome: { YES: driftYes, NO: driftNo },
     });
 
+    // CRITICAL FIX: Only check inventory drift, NOT avgCost
+    // avgCost should be computed from our fill history, not from Data API
     const needsUpdate =
       Math.abs(Number(mm.yesInventory) - nextYes) > 0.0001 ||
-      Math.abs(Number(mm.noInventory) - nextNo) > 0.0001 ||
-      Math.abs(Number(mm.avgYesCost) - nextAvgYes) > 0.0001 ||
-      Math.abs(Number(mm.avgNoCost) - nextAvgNo) > 0.0001;
+      Math.abs(Number(mm.noInventory) - nextNo) > 0.0001;
 
     if (needsUpdate) {
       await prisma.marketMaker.update({
@@ -578,8 +588,10 @@ async function syncInventoryFromChain(
         data: {
           yesInventory: nextYes,
           noInventory: nextNo,
-          avgYesCost: nextAvgYes,
-          avgNoCost: nextAvgNo,
+          // CRITICAL FIX: Don't overwrite avgCost from Data API
+          // Only reset avgCost to 0 when inventory goes to 0 (position fully closed)
+          ...(nextYes === 0 && { avgYesCost: 0 }),
+          ...(nextNo === 0 && { avgNoCost: 0 }),
         },
       });
     }
@@ -602,7 +614,7 @@ export function verifyFillAgainstChain(
     noInventory: unknown;
     market?: { clobTokenIds?: string[] | null } | null;
   },
-  order: { outcome: string; side: string },
+  order: { outcome: MarketOutcome; side: OrderSide },
   fillSize: number
 ): { verified: boolean; reason?: string } {
   if (!chainPositionMap) {
@@ -934,7 +946,7 @@ async function checkAllFills(
  */
 export async function processFill(
   mm: { id: string; yesInventory: unknown; noInventory: unknown; avgYesCost: unknown; avgNoCost: unknown; realizedPnl: unknown },
-  order: { id: string; orderId: string; outcome: string; side: string; price: unknown; size: unknown },
+  order: { id: string; orderId: string; outcome: MarketOutcome; side: OrderSide; price: unknown; size: unknown },
   result?: MarketMakingResult,
   filledSize?: number,
   finalizeOrder = true,
@@ -2063,8 +2075,8 @@ async function processMarketMaker(
           o
         ): o is {
           orderId: string;
-          outcome: "YES" | "NO";
-          side: "BID" | "ASK";
+          outcome: MarketOutcome;
+          side: OrderSide;
           price: number;
           size: number;
           createdAt: string;
@@ -2077,8 +2089,8 @@ async function processMarketMaker(
       string,
       {
         orderId: string;
-        outcome: "YES" | "NO";
-        side: "BID" | "ASK";
+        outcome: MarketOutcome;
+        side: OrderSide;
         price: number;
         size: number;
         createdAt: string;
@@ -2086,15 +2098,23 @@ async function processMarketMaker(
     >();
     const duplicateClobOrders: {
       orderId: string;
-      outcome: "YES" | "NO";
-      side: "BID" | "ASK";
+      outcome: MarketOutcome;
+      side: OrderSide;
       price: number;
       size: number;
       createdAt: string;
     }[] = [];
 
     for (const [key, desired] of desiredQuotes) {
-      const [outcome, side] = key.split("-");
+      const [outcomeRaw, sideRaw] = key.split("-");
+      const outcome = toMarketOutcome(outcomeRaw);
+      const side = toOrderSide(sideRaw);
+      if (!outcome || !side) {
+        console.warn(
+          `[MarketMaking] Skipping malformed quote key ${key} for ${mm.market.slug}`
+        );
+        continue;
+      }
       const matches = clobOrdersForMarket
         .filter(
           (o) => {
@@ -2172,7 +2192,15 @@ async function processMarketMaker(
 
     for (const [key, desired] of desiredQuotes) {
       if (satisfiedQuotes.has(key)) continue;
-      const [outcome, side, tierStr] = key.split("-");
+      const [outcomeRaw, sideRaw, tierStr] = key.split("-");
+      const outcome = toMarketOutcome(outcomeRaw);
+      const side = toOrderSide(sideRaw);
+      if (!outcome || !side) {
+        console.warn(
+          `[MarketMaking] Skipping malformed quote key ${key} for ${mm.market.slug}`
+        );
+        continue;
+      }
       const tier = Number(tierStr);
 
       const match = clobOrderMatchByKey.get(key);
@@ -2229,9 +2257,17 @@ async function processMarketMaker(
     if (satisfiedQuotes.has(key)) continue;
 
     // Parse the key: "OUTCOME-SIDE-TIER" (e.g., "YES-BID-0", "NO-ASK-1")
-    const [outcome, side, tierStr] = key.split("-");
+    const [outcomeRaw, sideRaw, tierStr] = key.split("-");
+    const outcome = toMarketOutcome(outcomeRaw);
+    const side = toOrderSide(sideRaw);
+    if (!outcome || !side) {
+      console.warn(
+        `[MarketMaking] Skipping malformed quote key ${key} for ${mm.market.slug}`
+      );
+      continue;
+    }
     const tier = parseInt(tierStr, 10);
-    const orderSide = side === "BID" ? "BUY" : "SELL";
+    const orderSide: FillSide = side === "BID" ? "BUY" : "SELL";
     const isYesOutcome = outcome === "YES";
 
     // PRE-ORDER GATES: Check balance/position before placing order
@@ -2284,7 +2320,7 @@ async function processMarketMaker(
 
     const orderResult = await placeOrder({
       tokenId: desired.tokenId,
-      side: orderSide as "BUY" | "SELL",
+      side: orderSide,
       price: desired.price,
       size: desired.size,
       orderType: "GTC",
@@ -2449,7 +2485,7 @@ async function processMarketMaker(
  */
 async function cancelAllOrdersForMM(
   mmId: string,
-  orders: Array<{ id: string; orderId: string; outcome: string; side: string }>,
+  orders: Array<{ id: string; orderId: string; outcome: MarketOutcome; side: OrderSide }>,
   result: MarketMakingResult
 ): Promise<void> {
   for (const order of orders) {
@@ -2470,8 +2506,8 @@ export async function logQuoteAction(
   marketMakerId: string,
   action: string,
   data: {
-    outcome?: string;
-    side?: string;
+    outcome?: MarketOutcome;
+    side?: QuoteSide;
     tier?: number;
     price?: number;
     size?: number;
@@ -2566,7 +2602,7 @@ export async function stopAllMarketMaking(): Promise<{ cancelled: number }> {
 interface ReconciliationDrift {
   marketId: string;
   slug: string;
-  outcome: "YES" | "NO";
+  outcome: MarketOutcome;
   dbInventory: number;
   chainPosition: number;
   drift: number;

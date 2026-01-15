@@ -40,6 +40,13 @@ const KALSHI_SOFT_DISQUALIFY_PREFIXES = [
   "Queue too slow",
   "Volume too low",
 ];
+const CANDIDATE_CACHE_MAX_AGE_HOURS = Number(
+  process.env.MM_CANDIDATES_MAX_AGE_HOURS ?? 36
+);
+
+type ScoredResult = MMScreeningResult & {
+  venue: "POLYMARKET" | "KALSHI";
+};
 
 const isKalshiHardReason = (reason: string) =>
   !KALSHI_SOFT_DISQUALIFY_PREFIXES.some((prefix) => reason.startsWith(prefix));
@@ -115,6 +122,15 @@ const stratifyMarkets = (
   return selected;
 };
 
+const shouldIncludeResult = (
+  result: ScoredResult,
+  options: { eligibleOnly: boolean; minScore: number }
+) => {
+  if (options.eligibleOnly && !result.eligible) return false;
+  if (result.totalScore < options.minScore) return false;
+  return true;
+};
+
 async function fetchKalshiRecentTrades(ticker: string) {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const minTs = nowSeconds - KALSHI_TRADE_LOOKBACK_SECONDS;
@@ -145,6 +161,137 @@ async function fetchKalshiRecentTrades(ticker: string) {
   };
 }
 
+async function screenPolymarketMarket(
+  market: {
+    id: string;
+    slug: string;
+    question: string;
+    category: string | null;
+    endDate: Date | null;
+    yesPrice: number | null;
+    volume24h: number | null;
+    clobTokenIds: string[];
+  },
+  params: MMScreeningParams,
+  options: { eligibleOnly: boolean; minScore: number }
+): Promise<ScoredResult | null> {
+  const yesTokenId = market.clobTokenIds?.[0];
+  const noTokenId = market.clobTokenIds?.[1];
+  if (!yesTokenId) return null;
+
+  const [yesBook, yesMidpoint, yesSpread] = await Promise.all([
+    getOrderbook(yesTokenId),
+    getMidpointPrice(yesTokenId),
+    getSpread(yesTokenId),
+  ]);
+
+  let noBook = undefined;
+  let noMidpoint: number | null = null;
+  let noSpread: number | null = null;
+  if (noTokenId) {
+    [noBook, noMidpoint, noSpread] = await Promise.all([
+      getOrderbook(noTokenId),
+      getMidpointPrice(noTokenId),
+      getSpread(noTokenId),
+    ]);
+  }
+
+  const result = screenMarketForMM(
+    {
+      id: market.id,
+      slug: market.slug,
+      question: market.question,
+      category: market.category,
+      endDate: market.endDate,
+      yesPrice: market.yesPrice,
+      volume24h: market.volume24h ? Number(market.volume24h) : 0,
+    },
+    yesBook,
+    params,
+    {
+      yes: { midpoint: yesMidpoint, spread: yesSpread },
+      no: noTokenId ? { midpoint: noMidpoint, spread: noSpread } : undefined,
+    },
+    noBook
+  );
+
+  const scored: ScoredResult = { ...result, venue: "POLYMARKET" };
+  return shouldIncludeResult(scored, options) ? scored : null;
+}
+
+async function screenKalshiMarket(
+  market: {
+    id: string;
+    slug: string;
+    question: string;
+    category: string | null;
+    endDate: Date | null;
+    yesPrice: number | null;
+    volume24h: number | null;
+    priceRanges: unknown;
+    eventTicker: string | null;
+  },
+  params: MMScreeningParams,
+  options: { eligibleOnly: boolean; minScore: number }
+): Promise<ScoredResult | null> {
+  if (isKalshiComboMarket(market.id, market.eventTicker)) {
+    return null;
+  }
+
+  registerDefaultVenues();
+  const adapter = getVenueAdapter("kalshi");
+  const orderbook = await adapter.getOrderbookSnapshot(market.id);
+  const priceRanges = Array.isArray(market.priceRanges)
+    ? (market.priceRanges as unknown as PriceRange[])
+    : null;
+  const midReference =
+    market.yesPrice !== null && market.yesPrice !== undefined
+      ? Number(market.yesPrice)
+      : calculateMidPriceFromBook(orderbook.yes) ?? 0.5;
+  const tickSize = getTickSizeForPrice(midReference, priceRanges);
+
+  const result = screenMarketForMM(
+    {
+      id: market.id,
+      slug: market.slug,
+      question: market.question,
+      category: market.category,
+      endDate: market.endDate,
+      yesPrice: market.yesPrice ? Number(market.yesPrice) : null,
+      volume24h: market.volume24h ? Number(market.volume24h) : 0,
+      tickSize,
+    },
+    orderbook.yes,
+    params,
+    undefined,
+    orderbook.no
+  );
+
+  const hardReasons = result.disqualifyReasons.filter(isKalshiHardReason);
+  let eligible = hardReasons.length === 0;
+
+  if (eligible) {
+    const tradeStats = await fetchKalshiRecentTrades(market.id);
+    eligible =
+      tradeStats.recentTradeVolume >= KALSHI_MIN_VOLUME_24H ||
+      tradeStats.tradeCount >= KALSHI_MIN_RECENT_TRADES;
+    if (!eligible) {
+      hardReasons.push(
+        `Recent trades too low (${tradeStats.tradeCount} trades, ${tradeStats.recentTradeVolume} vol)`
+      );
+    }
+  }
+
+  const scored: ScoredResult = {
+    ...result,
+    venue: "KALSHI",
+    eligible,
+    disqualifyReasons: hardReasons,
+  };
+
+  return shouldIncludeResult(scored, options) ? scored : null;
+}
+
 /**
  * GET /api/mm-candidates
  * Screen markets for MM viability and return scored candidates
@@ -153,8 +300,10 @@ export async function GET(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams;
     const limit = Number(searchParams.get("limit") || 50);
+    const marketIdParam = searchParams.get("marketId");
     const eligibleOnly = searchParams.get("eligibleOnly") !== "false";
     const minScore = Number(searchParams.get("minScore") || 0);
+    const sourceParam = (searchParams.get("source") || "").toLowerCase();
     const venueParam = (searchParams.get("venue") || "all").toUpperCase();
     const venueFilter =
       venueParam === "POLYMARKET" || venueParam === "KALSHI"
@@ -162,6 +311,12 @@ export async function GET(request: NextRequest) {
         : "ALL";
     const wantsPolymarket = venueFilter === "ALL" || venueFilter === "POLYMARKET";
     const wantsKalshi = venueFilter === "ALL" || venueFilter === "KALSHI";
+    const source =
+      sourceParam === "live"
+        ? "live"
+        : marketIdParam
+        ? "live"
+        : "cached";
 
     // Get custom params if provided
     const params: MMScreeningParams = { ...DEFAULT_MM_SCREENING_PARAMS };
@@ -175,11 +330,159 @@ export async function GET(request: NextRequest) {
       params.minTimeToEndHours = Number(searchParams.get("minTimeToEndHours"));
     }
 
-    type ScoredResult = MMScreeningResult & {
-      venue: "POLYMARKET" | "KALSHI";
-    };
     const results: ScoredResult[] = [];
     const takeCount = limit * 3;
+
+    if (!marketIdParam && source === "cached") {
+      const cacheCutoff = new Date(
+        Date.now() - CANDIDATE_CACHE_MAX_AGE_HOURS * 60 * 60 * 1000
+      );
+      const cachedCandidates = await prisma.mmCandidate.findMany({
+        where: {
+          scoredAt: { gte: cacheCutoff },
+          ...(eligibleOnly ? { eligible: true } : {}),
+          ...(minScore > 0 ? { totalScore: { gte: minScore } } : {}),
+          market: {
+            active: true,
+            marketMaker: null,
+            ...(venueFilter === "ALL" ? {} : { venue: venueFilter }),
+          },
+        },
+        orderBy: { totalScore: "desc" },
+        take: limit,
+        include: {
+          market: {
+            select: {
+              id: true,
+              slug: true,
+              question: true,
+              category: true,
+              endDate: true,
+              venue: true,
+            },
+          },
+        },
+      });
+
+      if (cachedCandidates.length > 0) {
+        return NextResponse.json({
+          total: cachedCandidates.length,
+          params,
+          candidates: cachedCandidates.map((row) => ({
+            marketId: row.marketId,
+            slug: row.market.slug,
+            question: row.market.question,
+            category: row.market.category,
+            endDate: row.market.endDate?.toISOString() ?? null,
+            venue: row.market.venue,
+            midPrice: row.midPrice !== null ? Number(row.midPrice) : 0,
+            spreadTicks: row.spreadTicks ?? 0,
+            spreadPercent: row.spreadPercent !== null ? Number(row.spreadPercent) : 0,
+            topDepth: row.topDepthNotional !== null ? Number(row.topDepthNotional) : 0,
+            depth3c: row.depth3cTotal !== null ? Number(row.depth3cTotal) : 0,
+            bookSlope: row.bookSlope !== null ? Number(row.bookSlope) : 0,
+            volume24h: row.volume24h !== null ? Number(row.volume24h) : 0,
+            queueSpeed: row.queueSpeed !== null ? Number(row.queueSpeed) : 0,
+            queueDepthRatio:
+              row.queueDepthRatio !== null ? Number(row.queueDepthRatio) : 0,
+            hoursToEnd: row.hoursToEnd !== null ? Number(row.hoursToEnd) : null,
+            scores: {
+              liquidity: row.liquidityScore,
+              flow: row.flowScore,
+              time: row.timeScore,
+              priceZone: row.priceZoneScore,
+              queueSpeed: row.queueSpeedScore,
+              queueDepth: row.queueDepthScore,
+              total: row.totalScore,
+            },
+            flags: row.flags ?? [],
+            eligible: row.eligible,
+            disqualifyReasons: row.disqualifyReasons ?? [],
+            scoredAt: row.scoredAt.toISOString(),
+          })),
+        });
+      }
+    }
+
+    if (marketIdParam) {
+      const market = await prisma.market.findUnique({
+        where: { id: marketIdParam },
+        select: {
+          id: true,
+          slug: true,
+          question: true,
+          category: true,
+          endDate: true,
+          venue: true,
+          yesPrice: true,
+          volume24h: true,
+          clobTokenIds: true,
+          priceRanges: true,
+          eventTicker: true,
+        },
+      });
+
+      if (!market) {
+        return NextResponse.json({ total: 0, candidates: [] });
+      }
+
+      const options = { eligibleOnly, minScore };
+      if (market.venue === "POLYMARKET") {
+        const scored = await screenPolymarketMarket(
+          {
+            id: market.id,
+            slug: market.slug,
+            question: market.question,
+            category: market.category,
+            endDate: market.endDate,
+            yesPrice: market.yesPrice ? Number(market.yesPrice) : null,
+            volume24h: market.volume24h ? Number(market.volume24h) : 0,
+            clobTokenIds: market.clobTokenIds ?? [],
+          },
+          params,
+          options
+        );
+        return NextResponse.json({
+          total: scored ? 1 : 0,
+          candidates: scored
+            ? [{ ...scored, scoredAt: new Date().toISOString() }]
+            : [],
+        });
+      }
+
+      const kalshiParams: MMScreeningParams = {
+        ...params,
+        minVolume24h: Math.min(params.minVolume24h, KALSHI_MIN_VOLUME_24H),
+        minQueueSpeed: Math.min(params.minQueueSpeed, 0.25),
+        minTopDepthNotional: Math.min(params.minTopDepthNotional, 100),
+        minDepthWithin3cNotional: Math.min(params.minDepthWithin3cNotional, 500),
+        minDepthEachSideWithin3c: Math.min(params.minDepthEachSideWithin3c, 150),
+        depthRangeCents: 2,
+      };
+
+      const scored = await screenKalshiMarket(
+        {
+          id: market.id,
+          slug: market.slug,
+          question: market.question,
+          category: market.category,
+          endDate: market.endDate,
+          yesPrice: market.yesPrice ? Number(market.yesPrice) : null,
+          volume24h: market.volume24h ? Number(market.volume24h) : 0,
+          priceRanges: market.priceRanges,
+          eventTicker: market.eventTicker,
+        },
+        kalshiParams,
+        options
+      );
+
+      return NextResponse.json({
+        total: scored ? 1 : 0,
+        candidates: scored
+          ? [{ ...scored, scoredAt: new Date().toISOString() }]
+          : [],
+      });
+    }
 
     if (wantsPolymarket) {
       // Fetch active Polymarket markets from DB
@@ -477,6 +780,7 @@ export async function GET(request: NextRequest) {
         flags: r.flags,
         eligible: r.eligible,
         disqualifyReasons: r.disqualifyReasons,
+        scoredAt: new Date().toISOString(),
       })),
     });
   } catch (error) {

@@ -29,6 +29,92 @@ const DEPENDENCY_FAILURE_THRESHOLD = Number(
 let clobFailureStreak = 0;
 let dataApiFailureStreak = 0;
 
+type MarketOutcome = "YES" | "NO";
+type OrderSide = "BID" | "ASK";
+
+const AVG_COST_TOLERANCE = Number(
+  process.env.MM_AVG_COST_TOLERANCE ?? 0.0001
+);
+const AVG_COST_INVENTORY_TOLERANCE = Number(
+  process.env.MM_AVG_COST_INVENTORY_TOLERANCE ?? 0.0001
+);
+
+type AvgCostComputation = {
+  yesInventory: number;
+  noInventory: number;
+  avgYesCost: number;
+  avgNoCost: number;
+  clampedSellCount: number;
+};
+
+const computeAvgCostFromFills = (
+  fills: Array<{
+    id: string;
+    outcome: MarketOutcome;
+    side: "BUY" | "SELL";
+    price: unknown;
+    size: unknown;
+    filledAt: Date;
+  }>
+): AvgCostComputation => {
+  const ordered = [...fills].sort((a, b) => {
+    const timeDiff = a.filledAt.getTime() - b.filledAt.getTime();
+    if (timeDiff !== 0) return timeDiff;
+    return a.id.localeCompare(b.id);
+  });
+
+  let yesInventory = 0;
+  let noInventory = 0;
+  let avgYesCost = 0;
+  let avgNoCost = 0;
+  let clampedSellCount = 0;
+
+  for (const fill of ordered) {
+    const size = Number(fill.size);
+    const price = Number(fill.price);
+    if (!Number.isFinite(size) || size <= 0) continue;
+    if (!Number.isFinite(price) || price <= 0) continue;
+
+    if (fill.outcome === "YES") {
+      if (fill.side === "BUY") {
+        const totalCost = avgYesCost * yesInventory + price * size;
+        yesInventory += size;
+        avgYesCost = yesInventory > 0 ? totalCost / yesInventory : 0;
+      } else {
+        const applied = Math.min(yesInventory, size);
+        if (applied < size) clampedSellCount += 1;
+        yesInventory -= applied;
+        if (yesInventory <= 0) {
+          yesInventory = 0;
+          avgYesCost = 0;
+        }
+      }
+    } else {
+      if (fill.side === "BUY") {
+        const totalCost = avgNoCost * noInventory + price * size;
+        noInventory += size;
+        avgNoCost = noInventory > 0 ? totalCost / noInventory : 0;
+      } else {
+        const applied = Math.min(noInventory, size);
+        if (applied < size) clampedSellCount += 1;
+        noInventory -= applied;
+        if (noInventory <= 0) {
+          noInventory = 0;
+          avgNoCost = 0;
+        }
+      }
+    }
+  }
+
+  return {
+    yesInventory,
+    noInventory,
+    avgYesCost,
+    avgNoCost,
+    clampedSellCount,
+  };
+};
+
 async function getTrackedTokenIds(): Promise<Set<string>> {
   const marketMakers = await prisma.marketMaker.findMany({
     include: { market: { select: { clobTokenIds: true } } },
@@ -82,6 +168,7 @@ export interface SyncIssue {
     | "POSITION_DRIFT"
     | "POSITION_MISSING"
     | "PNL_MISMATCH"
+    | "AVG_COST_MISMATCH"
     | "ORPHAN_ORDER"
     | "UNKNOWN_TOKEN"
     | "DATA_API_UNAVAILABLE"
@@ -483,8 +570,8 @@ async function processUnrecordedFill(
   marketMakerId: string,
   order: {
     orderId: string;
-    outcome: string;
-    side: string;
+    outcome: MarketOutcome;
+    side: OrderSide;
     price: unknown;
   },
   fillSize: number,
@@ -648,14 +735,18 @@ async function syncPositions(
       });
     }
 
-    if (yesDrift > 0.0001 || noDrift > 0.0001 || yesAvgDrift > 0.0001 || noAvgDrift > 0.0001) {
+    // CRITICAL FIX: Only update inventory from chain, NOT avgCost
+    // avgCost should be computed from our fill history, not from Data API's avgPrice
+    // which has different semantics (may include fees, all-time average, etc.)
+    if (yesDrift > 0.0001 || noDrift > 0.0001) {
       await prisma.marketMaker.update({
         where: { id: mm.id },
         data: {
           yesInventory: nextYes,
           noInventory: nextNo,
-          avgYesCost: nextAvgYes,
-          avgNoCost: nextAvgNo,
+          // Reset avgCost to 0 when inventory goes to 0 (position fully closed)
+          ...(nextYes === 0 && { avgYesCost: 0 }),
+          ...(nextNo === 0 && { avgNoCost: 0 }),
         },
       });
       result.positionsCorrected++;
@@ -738,6 +829,61 @@ async function verifyPnL(
       }
 
       result.pnlDiscrepancy = (result.pnlDiscrepancy ?? 0) + discrepancy;
+    }
+
+    const avgCost = computeAvgCostFromFills(
+      mm.fills.map((fill) => ({
+        id: fill.id,
+        outcome: fill.outcome as MarketOutcome,
+        side: fill.side as "BUY" | "SELL",
+        price: fill.price,
+        size: fill.size,
+        filledAt: fill.filledAt,
+      }))
+    );
+
+    const dbYesInventory = Number(mm.yesInventory);
+    const dbNoInventory = Number(mm.noInventory);
+    const yesInventoryDrift = Math.abs(dbYesInventory - avgCost.yesInventory);
+    const noInventoryDrift = Math.abs(dbNoInventory - avgCost.noInventory);
+
+    if (
+      yesInventoryDrift > AVG_COST_INVENTORY_TOLERANCE ||
+      noInventoryDrift > AVG_COST_INVENTORY_TOLERANCE
+    ) {
+      issues.push({
+        type: "AVG_COST_MISMATCH",
+        severity:
+          yesInventoryDrift > 0.1 || noInventoryDrift > 0.1 ? "ERROR" : "WARN",
+        marketSlug: mm.market?.slug,
+        details: {
+          dbYesInventory,
+          dbNoInventory,
+          computedYesInventory: avgCost.yesInventory,
+          computedNoInventory: avgCost.noInventory,
+          yesInventoryDrift,
+          noInventoryDrift,
+          storedAvgYesCost: Number(mm.avgYesCost),
+          storedAvgNoCost: Number(mm.avgNoCost),
+          computedAvgYesCost: avgCost.avgYesCost,
+          computedAvgNoCost: avgCost.avgNoCost,
+          clampedSellCount: avgCost.clampedSellCount,
+        },
+        action: "LOGGED",
+      });
+      continue;
+    }
+
+    const avgYesDrift = Math.abs(Number(mm.avgYesCost) - avgCost.avgYesCost);
+    const avgNoDrift = Math.abs(Number(mm.avgNoCost) - avgCost.avgNoCost);
+    if (avgYesDrift > AVG_COST_TOLERANCE || avgNoDrift > AVG_COST_TOLERANCE) {
+      await prisma.marketMaker.update({
+        where: { id: mm.id },
+        data: {
+          avgYesCost: avgCost.avgYesCost,
+          avgNoCost: avgCost.avgNoCost,
+        },
+      });
     }
   }
 
@@ -856,7 +1002,7 @@ export async function syncInventoryFromChain(options?: {
   corrected: number;
   driftDetails: Array<{
     marketSlug: string;
-    outcome: "YES" | "NO";
+    outcome: MarketOutcome;
     dbValue: number;
     chainValue: number;
     drift: number;
@@ -867,7 +1013,7 @@ export async function syncInventoryFromChain(options?: {
     corrected: 0,
     driftDetails: [] as Array<{
       marketSlug: string;
-      outcome: "YES" | "NO";
+      outcome: MarketOutcome;
       dbValue: number;
       chainValue: number;
       drift: number;
@@ -943,15 +1089,18 @@ export async function syncInventoryFromChain(options?: {
         });
       }
 
-      // Update if any drift detected
-      if (yesDrift > 0.0001 || noDrift > 0.0001 || yesAvgDrift > 0.0001 || noAvgDrift > 0.0001) {
+      // Update if any inventory drift detected
+      // CRITICAL FIX: Only update inventory from chain, NOT avgCost
+      // avgCost should be computed from our fill history, not from Data API
+      if (yesDrift > 0.0001 || noDrift > 0.0001) {
         await prisma.marketMaker.update({
           where: { id: mm.id },
           data: {
             yesInventory: chainYes,
             noInventory: chainNo,
-            avgYesCost: chainAvgYes,
-            avgNoCost: chainAvgNo,
+            // Reset avgCost to 0 when inventory goes to 0 (position fully closed)
+            ...(chainYes === 0 && { avgYesCost: 0 }),
+            ...(chainNo === 0 && { avgNoCost: 0 }),
           },
         });
         result.corrected++;
@@ -1071,13 +1220,20 @@ export async function resetToChain(): Promise<{
     const yesPos = yesTokenId ? positionMap.get(yesTokenId) : null;
     const noPos = noTokenId ? positionMap.get(noTokenId) : null;
 
+    const nextYes = yesPos?.size ?? 0;
+    const nextNo = noPos?.size ?? 0;
+
     await prisma.marketMaker.update({
       where: { id: mm.id },
       data: {
-        yesInventory: yesPos?.size ?? 0,
-        noInventory: noPos?.size ?? 0,
-        avgYesCost: yesPos?.avgPrice ?? 0,
-        avgNoCost: noPos?.avgPrice ?? 0,
+        yesInventory: nextYes,
+        noInventory: nextNo,
+        // CRITICAL FIX: Don't overwrite avgCost from Data API's avgPrice
+        // Only reset avgCost to 0 when inventory goes to 0 (position fully closed)
+        // NOTE: This doesn't recalculate avgCost from fills - that would require
+        // computing weighted average from MarketMakerFill records
+        ...(nextYes === 0 && { avgYesCost: 0 }),
+        ...(nextNo === 0 && { avgNoCost: 0 }),
         // NOTE: We don't reset realizedPnl - that's historical
       },
     });

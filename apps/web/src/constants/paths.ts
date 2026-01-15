@@ -1,5 +1,6 @@
 export const Paths = {
   HOME: "/",
+  DISCOVER: "/discover",
   CANDIDATES: "/candidates",
   BASKET: "/basket",
   PORTFOLIO: "/portfolio",
@@ -9,6 +10,7 @@ export const Paths = {
 } as const;
 
 export const ProtectedPaths = [
+  Paths.DISCOVER,
   Paths.CANDIDATES,
   Paths.BASKET,
   Paths.PORTFOLIO,

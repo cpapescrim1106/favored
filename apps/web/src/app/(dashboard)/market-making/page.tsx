@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Table,
@@ -27,6 +27,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Collapsible,
   CollapsibleContent,
@@ -169,11 +170,49 @@ interface MMCandidate {
   flags: string[];
   eligible: boolean;
   disqualifyReasons: string[];
+  scoredAt?: string | null;
 }
 
 interface MMCandidatesData {
   total: number;
   candidates: MMCandidate[];
+}
+
+interface UniverseMarket {
+  marketId: string;
+  slug: string;
+  question: string;
+  category: string | null;
+  endDate: string | null;
+  venue: "POLYMARKET" | "KALSHI";
+  volume24h: number;
+  midPrice: number | null;
+  spreadTicks: number | null;
+  lastUpdated: string | null;
+}
+
+interface UniverseData {
+  total: number;
+  markets: UniverseMarket[];
+}
+
+interface HotMarket {
+  marketId: string;
+  question: string;
+  category: string | null;
+  endDate: string | null;
+  venue: "POLYMARKET" | "KALSHI";
+  volume24h: number;
+  midPrice: number | null;
+  spreadTicks: number | null;
+  score: number | null;
+  scoredAt: string | null;
+  reason: string;
+}
+
+interface HotListData {
+  total: number;
+  markets: HotMarket[];
 }
 
 interface FormValues {
@@ -195,6 +234,7 @@ export default function MarketMakingPage() {
   const [dialogStep, setDialogStep] = useState<"select" | "configure">("select");
   const [pnlWindow, setPnlWindow] = useState<"24h" | "1w" | "all">("24h");
   const [venueFilter, setVenueFilter] = useState<"all" | "POLYMARKET" | "KALSHI">("all");
+  const [addMarketTab, setAddMarketTab] = useState<"candidates" | "universe">("candidates");
   const [candidateVenueFilter, setCandidateVenueFilter] = useState<
     "all" | "POLYMARKET" | "KALSHI"
   >("all");
@@ -207,6 +247,23 @@ export default function MarketMakingPage() {
   const [candidateScreening, setCandidateScreening] = useState(false);
   const [candidateLastRunAt, setCandidateLastRunAt] = useState<Date | null>(null);
   const [candidateError, setCandidateError] = useState<string | null>(null);
+  const [universeVenueFilter, setUniverseVenueFilter] = useState<
+    "all" | "POLYMARKET" | "KALSHI"
+  >("all");
+  const [universeResults, setUniverseResults] = useState<UniverseMarket[]>([]);
+  const [universeTotal, setUniverseTotal] = useState<number | null>(null);
+  const [universeLoading, setUniverseLoading] = useState(false);
+  const [universeLastRunAt, setUniverseLastRunAt] = useState<Date | null>(null);
+  const [universeError, setUniverseError] = useState<string | null>(null);
+  const [hotVenueFilter, setHotVenueFilter] = useState<
+    "all" | "POLYMARKET" | "KALSHI"
+  >("all");
+  const [hotResults, setHotResults] = useState<HotMarket[]>([]);
+  const [hotLoading, setHotLoading] = useState(false);
+  const [hotLastRunAt, setHotLastRunAt] = useState<Date | null>(null);
+  const [hotError, setHotError] = useState<string | null>(null);
+  const [rescoreMarketId, setRescoreMarketId] = useState<string | null>(null);
+  const [rescoreError, setRescoreError] = useState<string | null>(null);
   const [bulkDialogOpen, setBulkDialogOpen] = useState(false);
   const [bulkApplyToAll, setBulkApplyToAll] = useState(false);
   const [fillsOpen, setFillsOpen] = useState(false);
@@ -269,7 +326,16 @@ export default function MarketMakingPage() {
       const data: MMCandidatesData = await res.json();
       setCandidateResults(data.candidates ?? []);
       setCandidateTotal(data.total ?? data.candidates?.length ?? 0);
-      setCandidateLastRunAt(new Date());
+      const scoredTimes = (data.candidates ?? [])
+        .map((candidate) =>
+          candidate.scoredAt ? new Date(candidate.scoredAt).getTime() : null
+        )
+        .filter((value): value is number => value !== null);
+      if (scoredTimes.length > 0) {
+        setCandidateLastRunAt(new Date(Math.max(...scoredTimes)));
+      } else {
+        setCandidateLastRunAt(new Date());
+      }
     } catch (error) {
       setCandidateError(error instanceof Error ? error.message : "Failed to fetch candidates");
       setCandidateResults([]);
@@ -278,6 +344,81 @@ export default function MarketMakingPage() {
       setCandidateScreening(false);
     }
   };
+
+  const runUniverseFetch = async () => {
+    setUniverseLoading(true);
+    setUniverseError(null);
+    try {
+      const res = await fetch(
+        `/api/mm-universe?limit=60&venue=${universeVenueFilter}`
+      );
+      if (!res.ok) throw new Error("Failed to fetch universe markets");
+      const data: UniverseData = await res.json();
+      setUniverseResults(data.markets ?? []);
+      setUniverseTotal(data.total ?? data.markets?.length ?? 0);
+      setUniverseLastRunAt(new Date());
+    } catch (error) {
+      setUniverseError(error instanceof Error ? error.message : "Failed to fetch universe");
+      setUniverseResults([]);
+      setUniverseTotal(0);
+    } finally {
+      setUniverseLoading(false);
+    }
+  };
+
+  const runHotListFetch = async () => {
+    setHotLoading(true);
+    setHotError(null);
+    try {
+      const res = await fetch(
+        `/api/mm-hotlist?limit=12&venue=${hotVenueFilter}`
+      );
+      if (!res.ok) throw new Error("Failed to fetch hot list");
+      const data: HotListData = await res.json();
+      setHotResults(data.markets ?? []);
+      setHotLastRunAt(new Date());
+    } catch (error) {
+      setHotError(error instanceof Error ? error.message : "Failed to fetch hot list");
+      setHotResults([]);
+    } finally {
+      setHotLoading(false);
+    }
+  };
+
+  const rescoreMarket = async (marketId: string) => {
+    setRescoreMarketId(marketId);
+    setRescoreError(null);
+    try {
+      const res = await fetch(
+        `/api/mm-candidates?marketId=${encodeURIComponent(marketId)}&eligibleOnly=false`
+      );
+      if (!res.ok) throw new Error("Failed to rescore market");
+      const data: MMCandidatesData = await res.json();
+      const candidate = data.candidates?.[0] ?? null;
+      if (!candidate) {
+        throw new Error("No scored result returned for this market");
+      }
+      setSelectedCandidate(candidate);
+      setDialogStep("configure");
+    } catch (error) {
+      setRescoreError(error instanceof Error ? error.message : "Failed to rescore market");
+    } finally {
+      setRescoreMarketId(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!addDialogOpen) return;
+    if (addMarketTab !== "universe") return;
+    runUniverseFetch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addDialogOpen, addMarketTab, universeVenueFilter]);
+
+  useEffect(() => {
+    if (!addDialogOpen) return;
+    runHotListFetch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addDialogOpen, hotVenueFilter]);
 
   // Toggle MM enabled
   const toggleMM = useMutation({
@@ -409,6 +550,10 @@ export default function MarketMakingPage() {
     setSelectedCandidate(null);
     setDialogStep("select");
     setCandidateError(null);
+    setRescoreError(null);
+    setUniverseError(null);
+    setHotError(null);
+    setAddMarketTab("candidates");
   };
 
   const handleSelectCandidate = (candidate: MMCandidate) => {
@@ -465,6 +610,8 @@ export default function MarketMakingPage() {
   const filteredCandidateCount = filteredCandidates.length;
   const candidateCountLabel =
     candidateTotal === null ? "—" : `${filteredCandidateCount}/${candidateTotal}`;
+  const universeCountLabel =
+    universeTotal === null ? "—" : `${universeResults.length}/${universeTotal}`;
   const marketMakerOrder = new Map(
     marketMakers.map((mm, index) => [mm.id, index])
   );
@@ -914,7 +1061,7 @@ export default function MarketMakingPage() {
                 Add Market
               </Button>
             </DialogTrigger>
-            <DialogContent className="max-w-2xl">
+            <DialogContent className="max-w-5xl">
               {dialogStep === "select" ? (
                 <>
                   <DialogHeader>
@@ -925,181 +1072,438 @@ export default function MarketMakingPage() {
                     </DialogDescription>
                   </DialogHeader>
                   <div className="py-4">
-                    <div className="flex flex-col gap-3 pb-3">
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <span className="text-xs text-zinc-500 uppercase">Screen Venue</span>
-                        <div className="flex items-center gap-2">
-                          <div className="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1">
-                            {[
-                              { value: "all", label: "All" },
-                              { value: "POLYMARKET", label: "Poly" },
-                              { value: "KALSHI", label: "Kalshi" },
-                            ].map((option) => (
-                              <Button
-                                key={option.value}
-                                type="button"
-                                variant={
-                                  candidateScreenVenue === option.value ? "secondary" : "ghost"
-                                }
-                                size="sm"
-                                className="h-7 px-2 text-xs"
-                                onClick={() =>
-                                  setCandidateScreenVenue(
-                                    option.value as "all" | "POLYMARKET" | "KALSHI"
-                                  )
-                                }
-                              >
-                                {option.label}
-                              </Button>
-                            ))}
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs text-zinc-500">Eligible only</span>
-                            <Switch
-                              checked={candidateEligibleOnly}
-                              onCheckedChange={(checked) => setCandidateEligibleOnly(checked)}
-                            />
+                    <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_280px]">
+                      <div className="min-w-0">
+                        <Tabs value={addMarketTab} onValueChange={(value) =>
+                          setAddMarketTab(value as "candidates" | "universe")
+                        }>
+                          <TabsList>
+                            <TabsTrigger value="candidates">Candidates</TabsTrigger>
+                            <TabsTrigger value="universe">Universe</TabsTrigger>
+                          </TabsList>
+                          <TabsContent value="candidates" className="mt-4">
+                            <div className="flex flex-col gap-3 pb-3">
+                              <div className="flex flex-wrap items-center justify-between gap-3">
+                                <span className="text-xs text-zinc-500 uppercase">Screen Venue</span>
+                                <div className="flex items-center gap-2">
+                                  <div className="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1">
+                                    {[
+                                      { value: "all", label: "All" },
+                                      { value: "POLYMARKET", label: "Poly" },
+                                      { value: "KALSHI", label: "Kalshi" },
+                                    ].map((option) => (
+                                      <Button
+                                        key={option.value}
+                                        type="button"
+                                        variant={
+                                          candidateScreenVenue === option.value ? "secondary" : "ghost"
+                                        }
+                                        size="sm"
+                                        className="h-7 px-2 text-xs"
+                                        onClick={() =>
+                                          setCandidateScreenVenue(
+                                            option.value as "all" | "POLYMARKET" | "KALSHI"
+                                          )
+                                        }
+                                      >
+                                        {option.label}
+                                      </Button>
+                                    ))}
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-xs text-zinc-500">Eligible only</span>
+                                    <Switch
+                                      checked={candidateEligibleOnly}
+                                      onCheckedChange={(checked) => setCandidateEligibleOnly(checked)}
+                                    />
+                                  </div>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    onClick={runCandidateScreen}
+                                    disabled={candidateScreening}
+                                  >
+                                    {candidateScreening ? "Screening..." : "Run Screen"}
+                                  </Button>
+                                </div>
+                              </div>
+                              <div className="flex flex-wrap items-center justify-between gap-3">
+                                <span className="text-xs text-zinc-500 uppercase">Filter Results</span>
+                                <div className="flex items-center gap-3">
+                                  <div className="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1">
+                                    {[
+                                      { value: "all", label: "All" },
+                                      { value: "POLYMARKET", label: "Poly" },
+                                      { value: "KALSHI", label: "Kalshi" },
+                                    ].map((option) => (
+                                      <Button
+                                        key={option.value}
+                                        type="button"
+                                        variant={
+                                          candidateVenueFilter === option.value ? "secondary" : "ghost"
+                                        }
+                                        size="sm"
+                                        className="h-7 px-2 text-xs"
+                                        onClick={() =>
+                                          setCandidateVenueFilter(
+                                            option.value as "all" | "POLYMARKET" | "KALSHI"
+                                          )
+                                        }
+                                      >
+                                        {option.label}
+                                      </Button>
+                                    ))}
+                                  </div>
+                                  <span className="text-xs text-zinc-500">{candidateCountLabel}</span>
+                                </div>
+                              </div>
+                              {candidateLastRunAt && (
+                                <div className="text-xs text-zinc-500">
+                                  Last screened {formatDistanceToNow(candidateLastRunAt, { addSuffix: true })}
+                                </div>
+                              )}
+                              {rescoreError && (
+                                <div className="text-xs text-rose-500">{rescoreError}</div>
+                              )}
+                            </div>
+                            {candidateScreening ? (
+                              <div className="flex items-center justify-center py-12">
+                                <Loader2 className="h-8 w-8 animate-spin text-zinc-400" />
+                                <span className="ml-2 text-zinc-500">Screening markets...</span>
+                              </div>
+                            ) : candidateError ? (
+                              <div className="text-center py-12 text-zinc-500">
+                                <AlertTriangle className="h-12 w-12 mx-auto mb-2 opacity-20" />
+                                <p>{candidateError}</p>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="mt-4"
+                                  onClick={runCandidateScreen}
+                                >
+                                  <RefreshCw className="h-4 w-4 mr-1" />
+                                  Retry
+                                </Button>
+                              </div>
+                            ) : filteredCandidates.length === 0 ? (
+                              <div className="text-center py-12 text-zinc-500">
+                                <Search className="h-12 w-12 mx-auto mb-2 opacity-20" />
+                                <p>No markets found</p>
+                                <p className="text-sm">Run a screen or adjust filters</p>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="mt-4"
+                                  onClick={runCandidateScreen}
+                                >
+                                  <RefreshCw className="h-4 w-4 mr-1" />
+                                  Refresh
+                                </Button>
+                              </div>
+                            ) : (
+                              <ScrollArea className="h-[400px] pr-4">
+                                <div className="space-y-2">
+                                  {filteredCandidates.map((candidate) => (
+                                    <button
+                                      key={candidate.marketId}
+                                      onClick={() => handleSelectCandidate(candidate)}
+                                      className="w-full text-left p-3 rounded-lg border hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors"
+                                    >
+                                      <div className="flex items-start justify-between gap-4">
+                                        <div className="flex-1 min-w-0">
+                                          <p className="font-medium line-clamp-2 text-sm">
+                                            {candidate.question}
+                                          </p>
+                                          <div className="flex items-center gap-2 mt-1 text-xs text-zinc-500">
+                                            <Badge variant="outline" className="text-[10px] px-1.5 py-0">
+                                              {candidate.venue === "KALSHI" ? "Kalshi" : "Poly"}
+                                            </Badge>
+                                            <span>{candidate.category || "—"}</span>
+                                            <span>·</span>
+                                            <span>${candidate.volume24h >= 1000000 ? `${(candidate.volume24h / 1000000).toFixed(1)}M` : `${(candidate.volume24h / 1000).toFixed(0)}k`} vol</span>
+                                            <span>·</span>
+                                            <span>{candidate.spreadTicks} tick spread</span>
+                                            {candidate.hoursToEnd && (
+                                              <>
+                                                <span>·</span>
+                                                <span>{Math.round(candidate.hoursToEnd / 24)}d left</span>
+                                              </>
+                                            )}
+                                          </div>
+                                          {candidate.flags.length > 0 && (
+                                            <div className="flex gap-1 mt-1">
+                                              {candidate.flags.slice(0, 3).map((flag) => (
+                                                <Badge key={flag} variant="outline" className="text-xs">
+                                                  {flag}
+                                                </Badge>
+                                              ))}
+                                              {!candidate.eligible && (
+                                                <Badge variant="outline" className="text-xs text-zinc-500">
+                                                  Ineligible
+                                                </Badge>
+                                              )}
+                                            </div>
+                                          )}
+                                        </div>
+                                        <div className="flex items-center gap-3">
+                                          <div className="text-right">
+                                            <div className={`text-lg font-bold ${getScoreColor(candidate.scores.total)}`}>
+                                              {candidate.scores.total}
+                                            </div>
+                                            <div className="text-xs text-zinc-500">score</div>
+                                          </div>
+                                          <ChevronRight className="h-5 w-5 text-zinc-400" />
+                                        </div>
+                                      </div>
+                                    </button>
+                                  ))}
+                                </div>
+                              </ScrollArea>
+                            )}
+                          </TabsContent>
+                          <TabsContent value="universe" className="mt-4">
+                            <div className="flex flex-col gap-3 pb-3">
+                              <div className="flex flex-wrap items-center justify-between gap-3">
+                                <span className="text-xs text-zinc-500 uppercase">Filter Results</span>
+                                <div className="flex items-center gap-2">
+                                  <div className="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1">
+                                    {[
+                                      { value: "all", label: "All" },
+                                      { value: "POLYMARKET", label: "Poly" },
+                                      { value: "KALSHI", label: "Kalshi" },
+                                    ].map((option) => (
+                                      <Button
+                                        key={option.value}
+                                        type="button"
+                                        variant={
+                                          universeVenueFilter === option.value ? "secondary" : "ghost"
+                                        }
+                                        size="sm"
+                                        className="h-7 px-2 text-xs"
+                                        onClick={() =>
+                                          setUniverseVenueFilter(
+                                            option.value as "all" | "POLYMARKET" | "KALSHI"
+                                          )
+                                        }
+                                      >
+                                        {option.label}
+                                      </Button>
+                                    ))}
+                                  </div>
+                                  <span className="text-xs text-zinc-500">{universeCountLabel}</span>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={runUniverseFetch}
+                                    disabled={universeLoading}
+                                  >
+                                    {universeLoading ? "Refreshing..." : "Refresh"}
+                                  </Button>
+                                </div>
+                              </div>
+                              {universeLastRunAt && (
+                                <div className="text-xs text-zinc-500">
+                                  Last updated {formatDistanceToNow(universeLastRunAt, { addSuffix: true })}
+                                </div>
+                              )}
+                              {rescoreError && (
+                                <div className="text-xs text-rose-500">{rescoreError}</div>
+                              )}
+                            </div>
+                            {universeLoading ? (
+                              <div className="flex items-center justify-center py-12">
+                                <Loader2 className="h-8 w-8 animate-spin text-zinc-400" />
+                                <span className="ml-2 text-zinc-500">Loading universe...</span>
+                              </div>
+                            ) : universeError ? (
+                              <div className="text-center py-12 text-zinc-500">
+                                <AlertTriangle className="h-12 w-12 mx-auto mb-2 opacity-20" />
+                                <p>{universeError}</p>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="mt-4"
+                                  onClick={runUniverseFetch}
+                                >
+                                  <RefreshCw className="h-4 w-4 mr-1" />
+                                  Retry
+                                </Button>
+                              </div>
+                            ) : universeResults.length === 0 ? (
+                              <div className="text-center py-12 text-zinc-500">
+                                <Search className="h-12 w-12 mx-auto mb-2 opacity-20" />
+                                <p>No markets found</p>
+                                <p className="text-sm">Adjust filters or refresh</p>
+                              </div>
+                            ) : (
+                              <ScrollArea className="h-[400px] pr-4">
+                                <div className="space-y-2">
+                                  {universeResults.map((market) => (
+                                    <div
+                                      key={market.marketId}
+                                      className="w-full p-3 rounded-lg border hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors"
+                                    >
+                                      <div className="flex items-start justify-between gap-4">
+                                        <div className="flex-1 min-w-0">
+                                          <p className="font-medium line-clamp-2 text-sm">
+                                            {market.question}
+                                          </p>
+                                          <div className="flex items-center gap-2 mt-1 text-xs text-zinc-500">
+                                            <Badge variant="outline" className="text-[10px] px-1.5 py-0">
+                                              {market.venue === "KALSHI" ? "Kalshi" : "Poly"}
+                                            </Badge>
+                                            <span>{market.category || "—"}</span>
+                                            <span>·</span>
+                                            <span>${market.volume24h >= 1000000 ? `${(market.volume24h / 1000000).toFixed(1)}M` : `${(market.volume24h / 1000).toFixed(0)}k`} vol</span>
+                                            {market.spreadTicks !== null && (
+                                              <>
+                                                <span>·</span>
+                                                <span>{market.spreadTicks} tick spread</span>
+                                              </>
+                                            )}
+                                            {market.endDate && (
+                                              <>
+                                                <span>·</span>
+                                                <span>{Math.round((new Date(market.endDate).getTime() - Date.now()) / (1000 * 60 * 60 * 24))}d left</span>
+                                              </>
+                                            )}
+                                          </div>
+                                          {market.lastUpdated && (
+                                            <div className="mt-1 text-[11px] text-zinc-500">
+                                              Updated {formatDistanceToNow(new Date(market.lastUpdated), { addSuffix: true })}
+                                            </div>
+                                          )}
+                                        </div>
+                                        <Button
+                                          type="button"
+                                          size="sm"
+                                          variant="outline"
+                                          onClick={() => rescoreMarket(market.marketId)}
+                                          disabled={rescoreMarketId === market.marketId}
+                                        >
+                                          {rescoreMarketId === market.marketId ? "Rescoring..." : "Rescore"}
+                                        </Button>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </ScrollArea>
+                            )}
+                          </TabsContent>
+                        </Tabs>
+                      </div>
+                      <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-3 h-full">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <div className="text-xs text-zinc-500 uppercase">Hot List</div>
+                            <div className="text-sm font-medium">Live activity</div>
                           </div>
                           <Button
                             type="button"
-                            size="sm"
-                            onClick={runCandidateScreen}
-                            disabled={candidateScreening}
+                            size="icon"
+                            variant="ghost"
+                            onClick={runHotListFetch}
+                            disabled={hotLoading}
                           >
-                            {candidateScreening ? "Screening..." : "Run Screen"}
+                            <RefreshCw className="h-4 w-4" />
                           </Button>
                         </div>
-                      </div>
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <span className="text-xs text-zinc-500 uppercase">Filter Results</span>
-                        <div className="flex items-center gap-3">
-                          <div className="flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1">
-                            {[
-                              { value: "all", label: "All" },
-                              { value: "POLYMARKET", label: "Poly" },
-                              { value: "KALSHI", label: "Kalshi" },
-                            ].map((option) => (
-                              <Button
-                                key={option.value}
-                                type="button"
-                                variant={
-                                  candidateVenueFilter === option.value ? "secondary" : "ghost"
-                                }
-                                size="sm"
-                                className="h-7 px-2 text-xs"
-                                onClick={() =>
-                                  setCandidateVenueFilter(
-                                    option.value as "all" | "POLYMARKET" | "KALSHI"
-                                  )
-                                }
-                              >
-                                {option.label}
-                              </Button>
-                            ))}
-                          </div>
-                          <span className="text-xs text-zinc-500">{candidateCountLabel}</span>
-                        </div>
-                      </div>
-                      {candidateLastRunAt && (
-                        <div className="text-xs text-zinc-500">
-                          Last screened {formatDistanceToNow(candidateLastRunAt, { addSuffix: true })}
-                        </div>
-                      )}
-                    </div>
-                    {candidateScreening ? (
-                      <div className="flex items-center justify-center py-12">
-                        <Loader2 className="h-8 w-8 animate-spin text-zinc-400" />
-                        <span className="ml-2 text-zinc-500">Screening markets...</span>
-                      </div>
-                    ) : candidateError ? (
-                      <div className="text-center py-12 text-zinc-500">
-                        <AlertTriangle className="h-12 w-12 mx-auto mb-2 opacity-20" />
-                        <p>{candidateError}</p>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="mt-4"
-                          onClick={runCandidateScreen}
-                        >
-                          <RefreshCw className="h-4 w-4 mr-1" />
-                          Retry
-                        </Button>
-                      </div>
-                    ) : filteredCandidates.length === 0 ? (
-                      <div className="text-center py-12 text-zinc-500">
-                        <Search className="h-12 w-12 mx-auto mb-2 opacity-20" />
-                        <p>No markets found</p>
-                        <p className="text-sm">Run a screen or adjust filters</p>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="mt-4"
-                          onClick={runCandidateScreen}
-                        >
-                          <RefreshCw className="h-4 w-4 mr-1" />
-                          Refresh
-                        </Button>
-                      </div>
-                    ) : (
-                      <ScrollArea className="h-[400px] pr-4">
-                        <div className="space-y-2">
-                          {filteredCandidates.map((candidate) => (
-                            <button
-                              key={candidate.marketId}
-                              onClick={() => handleSelectCandidate(candidate)}
-                              className="w-full text-left p-3 rounded-lg border hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors"
+                        <div className="mt-3 flex items-center rounded-md border border-zinc-200 dark:border-zinc-800 p-1 w-fit">
+                          {[
+                            { value: "all", label: "All" },
+                            { value: "POLYMARKET", label: "Poly" },
+                            { value: "KALSHI", label: "Kalshi" },
+                          ].map((option) => (
+                            <Button
+                              key={option.value}
+                              type="button"
+                              variant={hotVenueFilter === option.value ? "secondary" : "ghost"}
+                              size="sm"
+                              className="h-7 px-2 text-xs"
+                              onClick={() =>
+                                setHotVenueFilter(option.value as "all" | "POLYMARKET" | "KALSHI")
+                              }
                             >
-                              <div className="flex items-start justify-between gap-4">
-                                <div className="flex-1 min-w-0">
-                                  <p className="font-medium line-clamp-2 text-sm">
-                                    {candidate.question}
-                                  </p>
-                                  <div className="flex items-center gap-2 mt-1 text-xs text-zinc-500">
-                                    <Badge variant="outline" className="text-[10px] px-1.5 py-0">
-                                      {candidate.venue === "KALSHI" ? "Kalshi" : "Poly"}
-                                    </Badge>
-                                    <span>{candidate.category || "—"}</span>
-                                    <span>·</span>
-                                    <span>${candidate.volume24h >= 1000000 ? `${(candidate.volume24h / 1000000).toFixed(1)}M` : `${(candidate.volume24h / 1000).toFixed(0)}k`} vol</span>
-                                    <span>·</span>
-                                    <span>{candidate.spreadTicks} tick spread</span>
-                                    {candidate.hoursToEnd && (
-                                      <>
-                                        <span>·</span>
-                                        <span>{Math.round(candidate.hoursToEnd / 24)}d left</span>
-                                      </>
-                                    )}
-                                  </div>
-                                  {candidate.flags.length > 0 && (
-                                    <div className="flex gap-1 mt-1">
-                                      {candidate.flags.slice(0, 3).map((flag) => (
-                                        <Badge key={flag} variant="outline" className="text-xs">
-                                          {flag}
-                                        </Badge>
-                                      ))}
-                                      {!candidate.eligible && (
-                                        <Badge variant="outline" className="text-xs text-zinc-500">
-                                          Ineligible
-                                        </Badge>
-                                      )}
-                                    </div>
-                                  )}
-                                </div>
-                                <div className="flex items-center gap-3">
-                                  <div className="text-right">
-                                    <div className={`text-lg font-bold ${getScoreColor(candidate.scores.total)}`}>
-                                      {candidate.scores.total}
-                                    </div>
-                                    <div className="text-xs text-zinc-500">score</div>
-                                  </div>
-                                  <ChevronRight className="h-5 w-5 text-zinc-400" />
-                                </div>
-                              </div>
-                            </button>
+                              {option.label}
+                            </Button>
                           ))}
                         </div>
-                      </ScrollArea>
-                    )}
+                        {hotLastRunAt && (
+                          <div className="mt-2 text-xs text-zinc-500">
+                            Updated {formatDistanceToNow(hotLastRunAt, { addSuffix: true })}
+                          </div>
+                        )}
+                        {hotError && (
+                          <div className="mt-2 text-xs text-rose-500">{hotError}</div>
+                        )}
+                        {hotLoading ? (
+                          <div className="flex items-center justify-center py-10">
+                            <Loader2 className="h-6 w-6 animate-spin text-zinc-400" />
+                          </div>
+                        ) : hotResults.length === 0 ? (
+                          <div className="py-10 text-center text-xs text-zinc-500">
+                            No hot markets found
+                          </div>
+                        ) : (
+                          <ScrollArea className="h-[420px] pr-3 mt-3">
+                            <div className="space-y-2">
+                              {hotResults.map((market) => (
+                                <div
+                                  key={market.marketId}
+                                  className="rounded-md border border-zinc-200 dark:border-zinc-800 p-2"
+                                >
+                                  <div className="flex items-start justify-between gap-2">
+                                    <div className="min-w-0">
+                                      <div className="text-xs font-medium line-clamp-2">
+                                        {market.question}
+                                      </div>
+                                      <div className="mt-1 flex items-center gap-1 text-[11px] text-zinc-500">
+                                        <Badge variant="outline" className="text-[9px] px-1 py-0">
+                                          {market.venue === "KALSHI" ? "Kalshi" : "Poly"}
+                                        </Badge>
+                                        <span>{market.category || "—"}</span>
+                                      </div>
+                                      <div className="mt-1 text-[11px] text-zinc-500">
+                                        {market.reason} ·{" "}
+                                        {market.volume24h >= 1000000
+                                          ? `${(market.volume24h / 1000000).toFixed(1)}M`
+                                          : `${(market.volume24h / 1000).toFixed(0)}k`}{" "}
+                                        vol
+                                        {market.score !== null && market.score !== undefined && (
+                                          <>
+                                            {" "}
+                                            · Score {market.score}
+                                          </>
+                                        )}
+                                      </div>
+                                      {market.scoredAt && (
+                                        <div className="mt-1 text-[10px] text-zinc-500">
+                                          Scored{" "}
+                                          {formatDistanceToNow(new Date(market.scoredAt), {
+                                            addSuffix: true,
+                                          })}
+                                        </div>
+                                      )}
+                                    </div>
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      variant="outline"
+                                      className="text-xs"
+                                      onClick={() => rescoreMarket(market.marketId)}
+                                      disabled={rescoreMarketId === market.marketId}
+                                    >
+                                      {rescoreMarketId === market.marketId ? "..." : "Rescore"}
+                                    </Button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </ScrollArea>
+                        )}
+                      </div>
+                    </div>
                   </div>
                   <DialogFooter>
                     <Button variant="outline" onClick={handleCloseDialog}>

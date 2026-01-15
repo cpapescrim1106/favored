@@ -9,6 +9,7 @@ import {
   ShoppingCart,
   PieChart,
   BarChart3,
+  Compass,
   Settings,
   ScrollText,
   AlertTriangle,
@@ -17,6 +18,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { useQuery } from "@tanstack/react-query";
 
 const tabs = [
+  { name: "Discover", href: Paths.DISCOVER, icon: Compass },
   { name: "Candidates", href: Paths.CANDIDATES, icon: Search },
   { name: "Basket", href: Paths.BASKET, icon: ShoppingCart },
   { name: "Portfolio", href: Paths.PORTFOLIO, icon: PieChart },

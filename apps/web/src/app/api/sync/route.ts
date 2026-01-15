@@ -324,8 +324,8 @@ export async function DELETE(request: NextRequest) {
         data: {
           yesInventory: yesPos?.size ?? 0,
           noInventory: noPos?.size ?? 0,
-          avgYesCost: yesPos?.avgPrice ?? 0,
-          avgNoCost: noPos?.avgPrice ?? 0,
+          ...((yesPos?.size ?? 0) === 0 ? { avgYesCost: 0 } : {}),
+          ...((noPos?.size ?? 0) === 0 ? { avgNoCost: 0 } : {}),
         },
       });
 
@@ -552,14 +552,14 @@ async function syncPositions(
       });
     }
 
-    if (yesDrift > 0.0001 || noDrift > 0.0001 || yesAvgDrift > 0.0001 || noAvgDrift > 0.0001) {
+    if (yesDrift > 0.0001 || noDrift > 0.0001) {
       await prisma.marketMaker.update({
         where: { id: mm.id },
         data: {
           yesInventory: nextYes,
           noInventory: nextNo,
-          avgYesCost: nextAvgYes,
-          avgNoCost: nextAvgNo,
+          ...(nextYes === 0 && { avgYesCost: 0 }),
+          ...(nextNo === 0 && { avgNoCost: 0 }),
         },
       });
       result.positionsCorrected++;
@@ -571,8 +571,8 @@ async function recordFill(
   marketMakerId: string,
   order: {
     orderId: string;
-    outcome: string;
-    side: string;
+    outcome: "YES" | "NO";
+    side: "BID" | "ASK";
     price: unknown;
   },
   fillSize: number,

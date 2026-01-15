@@ -100,8 +100,11 @@ const metrics = {
 const POSITION_UPDATES_ENABLED = process.env.CLOB_WS_POSITION_UPDATES === "true";
 let positionUpdatesWarned = false;
 
+type MarketOutcome = "YES" | "NO";
+type OrderSide = "BID" | "ASK";
+
 const orderLocks = new Map<string, Promise<void>>();
-const tokenMap = new Map<string, { marketMakerId: string; outcome: "YES" | "NO" }>();
+const tokenMap = new Map<string, { marketMakerId: string; outcome: MarketOutcome }>();
 
 let chainCache: { timestamp: number; map: Map<string, number> | null } | null = null;
 
@@ -185,8 +188,8 @@ const getChainPositionMap = async (): Promise<Map<string, number> | null> => {
 
 const logVerificationFailure = async (details: {
   orderId: string;
-  outcome: string;
-  side: string;
+  outcome: MarketOutcome;
+  side: OrderSide;
   claimedFillSize: number;
   reason?: string;
   marketSlug?: string | null;
@@ -435,11 +438,6 @@ const handlePositionUpdate = async (payload: ClobUserPositionPayload): Promise<v
   const size = parseNumber(payload.size);
   if (size === null) return;
 
-  const avgPrice =
-    parseNumber(payload.avgPrice) ??
-    parseNumber(payload.avg_price) ??
-    parseNumber(payload.average_price);
-
   const mapping = tokenMap.get(asset);
   if (!mapping) return;
 
@@ -448,11 +446,12 @@ const handlePositionUpdate = async (payload: ClobUserPositionPayload): Promise<v
       ? { yesInventory: size }
       : { noInventory: size };
 
-  if (avgPrice !== null) {
+  // Do not overwrite avgCost from CLOB/Data API; only reset to 0 on full close.
+  if (size === 0) {
     if (mapping.outcome === "YES") {
-      data.avgYesCost = avgPrice;
+      data.avgYesCost = 0;
     } else {
-      data.avgNoCost = avgPrice;
+      data.avgNoCost = 0;
     }
   }
 

@@ -66,6 +66,7 @@ async function getKalshiSeriesInfo(eventTicker: string) {
 
 async function buildMarketUrl(market: {
   venue: "POLYMARKET" | "KALSHI";
+  marketId: string;
   slug: string;
   eventSlug: string | null;
   eventTicker: string | null;
@@ -74,16 +75,18 @@ async function buildMarketUrl(market: {
     return `https://polymarket.com/event/${market.eventSlug || market.slug}`;
   }
 
+  const marketTicker = (market.marketId || market.slug).toLowerCase();
+
   if (!market.eventTicker) {
-    return `https://kalshi.com/markets/${market.slug.toLowerCase()}`;
+    return `https://kalshi.com/markets/${marketTicker}`;
   }
 
   const seriesInfo = await getKalshiSeriesInfo(market.eventTicker);
   if (!seriesInfo?.slug) {
-    return `https://kalshi.com/markets/${market.slug.toLowerCase()}`;
+    return `https://kalshi.com/markets/${marketTicker}`;
   }
 
-  return `https://kalshi.com/markets/${seriesInfo.ticker.toLowerCase()}/${seriesInfo.slug}/${market.slug.toLowerCase()}`;
+  return `https://kalshi.com/markets/${seriesInfo.ticker.toLowerCase()}/${seriesInfo.slug}/${marketTicker}`;
 }
 
 /**
@@ -269,6 +272,7 @@ export async function GET() {
         mm.market
           ? buildMarketUrl({
               venue: mm.market.venue,
+              marketId: mm.marketId,
               slug: mm.market.slug,
               eventSlug: mm.market.eventSlug ?? null,
               eventTicker: mm.market.eventTicker ?? null,

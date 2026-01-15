@@ -1,8 +1,10 @@
 import { prisma } from "../lib/db.js";
 import { configureCLOB, getPositions, fetchActiveOrders } from "@favored/shared";
 
+// CRITICAL FIX: Lowered from 1 to 0.1 to catch smaller drifts earlier
+// 1 share threshold was too high and allowed drift to accumulate unnoticed
 const INVENTORY_DRIFT_THRESHOLD = Number(
-  process.env.MM_INVENTORY_DRIFT_THRESHOLD ?? 1
+  process.env.MM_INVENTORY_DRIFT_THRESHOLD ?? 0.1
 );
 
 /**

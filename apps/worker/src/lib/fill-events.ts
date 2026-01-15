@@ -1,10 +1,13 @@
+import { Prisma } from "../../../web/src/generated/prisma/index.js";
 import { prisma } from "./db.js";
 
 const PENDING_FILL_TTL_MS = Number(
   process.env.MM_PENDING_FILL_TTL_MS ?? 15 * 60 * 1000
 );
+// CRITICAL FIX: Lowered from 0.1 to 0.0001 to ensure small fills are confirmed
+// Previously, fills < 0.1 shares would never confirm and expire with "ttl_expired"
 const PENDING_FILL_TOLERANCE = Number(
-  process.env.MM_PENDING_FILL_TOLERANCE ?? 0.1
+  process.env.MM_PENDING_FILL_TOLERANCE ?? 0.0001
 );
 
 type FillSide = "BUY" | "SELL";
@@ -44,21 +47,31 @@ export async function recordPendingFillEvent(
   });
   if (existing) return false;
 
-  await prisma.marketMakerFillEvent.create({
-    data: {
-      marketMakerId: input.marketMakerId,
-      outcome: input.outcome,
-      side: input.side,
-      orderId: input.orderId,
-      price,
-      size,
-      value: price * size,
-      matchedTotal,
-      source: input.source ?? null,
-      metadata: input.metadata ?? undefined,
-      observedAt: input.observedAt ?? new Date(),
-    },
-  });
+  try {
+    await prisma.marketMakerFillEvent.create({
+      data: {
+        marketMakerId: input.marketMakerId,
+        outcome: input.outcome,
+        side: input.side,
+        orderId: input.orderId,
+        price,
+        size,
+        value: price * size,
+        matchedTotal,
+        source: input.source ?? null,
+        metadata: input.metadata ?? undefined,
+        observedAt: input.observedAt ?? new Date(),
+      },
+    });
+  } catch (error) {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002"
+    ) {
+      return false;
+    }
+    throw error;
+  }
 
   return true;
 }
@@ -134,12 +147,14 @@ export async function confirmPendingFillsForMarketMaker(params: {
           : {
               size: size - confirmSize,
               value: price * (size - confirmSize),
+              observedAt: now,
               metadata: {
                 ...(event.metadata && typeof event.metadata === "object"
                   ? event.metadata
                   : {}),
                 originalSize: size,
                 confirmedSize: confirmSize,
+                lastConfirmedAt: now.toISOString(),
               },
             },
       });
